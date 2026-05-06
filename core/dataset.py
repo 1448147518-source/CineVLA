@@ -169,13 +169,15 @@ class CineVLADataset(Dataset):
                 frames = self._synthetic_sequence(primary_rgb)
 
             text = self.captions.get(base, '')
+            music = base + '_music.mp3' if os.path.exists(base + '_music.mp3') else None
 
             return {
-                'frames': frames,                               # [T, 3, 224, 224]
-                'poses': poses_7d.float(),                      # [N, 7]
-                'c2ws': torch.from_numpy(c2ws_np).float(),     # [N, 4, 4]
+                'frames': frames,
+                'poses': poses_7d.float(),
+                'c2ws': torch.from_numpy(c2ws_np).float(),
                 'intrinsics': torch.tensor([fx, fy, cx, cy]).float(),
                 'text': text,
+                'music_path': music,
                 'path': base,
             }
         except Exception as e:
@@ -191,9 +193,11 @@ def collate_fn(batch):
     poses = torch.stack([b['poses'] for b in batch])
     c2ws = torch.stack([b['c2ws'] for b in batch])
     intr = torch.stack([b['intrinsics'] for b in batch])
+    music = [b['music_path'] for b in batch]
     return {
         'frames': frames, 'poses': poses, 'c2ws': c2ws,
         'intrinsics': intr,
         'text': [b['text'] for b in batch],
+        'music_path': music[0] if all(m == music[0] for m in music) else music,
         'paths': [b['path'] for b in batch],
     }

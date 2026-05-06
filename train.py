@@ -5,7 +5,7 @@ Usage:
   python train.py default --workspace workspace --exp_name run1
 """
 
-import os, math, sys, contextlib
+import os, math, sys, contextlib, random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,6 +18,7 @@ from core.planner import Planner
 from core.refiner import Refiner
 from core.dataset import CineVLADataset, collate_fn
 from core.utils import init_logger
+from visualise.latent import LatentLogger
 
 
 class _SimpleAccelerator:
@@ -57,6 +58,8 @@ class CineVLA(nn.Module):
             hidden_dim=opt.planner_hidden_dim,
             num_layers=opt.planner_num_layers,
             num_heads=opt.planner_num_heads,
+            music_ca_layers=opt.music_ca_layers,
+            music_dim=opt.music_dim,
         )
         self.refiner = Refiner(
             pose_dim=opt.pose_dim, perception_dim=opt.perception_dim,
@@ -67,37 +70,41 @@ class CineVLA(nn.Module):
 
     def forward_planner(self, batch):
         frames, texts, gt_poses = batch['frames'], batch['text'], batch['poses']
+        music = batch.get('music_path')
+
+        # CFG: 10% text dropout during training
+        if self.training and random.random() < 0.1:
+            texts = [''] * len(texts)
+
         perc = self.perception(frames)
-        out = self.planner(perc, texts)
+        out = self.planner(perc, texts, music_path=music if isinstance(music, str) else None)
         loss = F.mse_loss(out['poses'], gt_poses)
         return {'loss': loss, 'pred_poses': out['poses']}
 
     def forward_refiner(self, batch):
         B = len(batch['text'])
-        frames = batch['frames']       # [B, T, 3, H, W]
-        gt_poses = batch['poses']      # [B, N, 7]
+        frames = batch['frames']
+        gt_poses = batch['poses']
         texts = batch['text']
+        music = batch.get('music_path')
         N = self.opt.pose_length
 
-        # Perception over full sequence
         perc = self.perception(frames)
         text_feats = self.planner.encode_text(texts)
 
-        # Random step t for refinement
+        # Variable chunk-size: sample K ∈ [1, refiner_lookahead]
         t = torch.randint(1, N - 1, (1,)).item()
-
-        # Use frame features at corresponding time indices
+        max_k = min(self.opt.refiner_lookahead, N - 1 - t)
+        K = torch.randint(1, max_k + 1, (1,)).item()
         T = frames.shape[1]
         frame_idx = min(int(t / N * T), T - 1)
 
-        # z_real: use the frame at time index (simulates "current camera view")
-        z_real = perc['features'][:, frame_idx, :]  # [B, dim]
-
-        # z_predicted: what the Planner's trajectory implies
-        z_pred = perc['global']  # global scene understanding
-
-        remaining = gt_poses[:, t:, :]
+        z_real = perc['features'][:, frame_idx, :]
+        z_pred = perc['global']
+        remaining = gt_poses[:, t:t + K, :]
         out = self.refiner(z_real, z_pred, remaining, text_feats)
+        out['z_real'] = z_real  # for latent visualization
+        out['z_pred'] = z_pred
         return out
 
     def forward(self, batch, stage='joint'):
@@ -105,7 +112,8 @@ class CineVLA(nn.Module):
         if stage == 'refiner': return self.forward_refiner(batch)
         p = self.forward_planner(batch)
         r = self.forward_refiner(batch)
-        return {'loss': p['loss'] + r['loss'], 'loss_p': p['loss'], 'loss_r': r['loss']}
+        return {'loss': p['loss'] + r['loss'], 'loss_p': p['loss'], 'loss_r': r['loss'],
+                'z_real': r.get('z_real'), 'z_pred': r.get('z_pred')}
 
 
 def main():
@@ -152,6 +160,12 @@ def main():
 
     gs, best = 0, float('inf')
 
+    # ── Latent state visualization (optional) ──
+    latent_logger = None
+    if opt.vis_latent:
+        latent_logger = LatentLogger(save_dir='pred_latent')
+        logger.info("[visualise] Latent state logging enabled → pred_latent/")
+
     def run_stage(name, epochs, keys=('loss',)):
         nonlocal gs, best
         for ep in range(epochs):
@@ -173,6 +187,12 @@ def main():
                     if k in out:
                         sl[k] += (out[k].detach().item() if has_acc else out[k].item())
                 seen += 1
+
+                # Latent state logging (for refiner / joint stages)
+                if latent_logger is not None and 'z_real' in out:
+                    if gs % opt.vis_latent_every == 0:
+                        latent_logger.log(out['z_real'], out['z_pred'],
+                                         step=gs, phase='train')
 
                 if gs % 20 == 0:
                     lr = sch.get_last_lr()[0]
@@ -199,6 +219,11 @@ def main():
     acc.wait_for_everyone()
     save_file(model.state_dict(), os.path.join(opt.workspace, opt.exp_name, 'model.safetensors'))
     logger.info("Saved.")
+
+    if latent_logger is not None:
+        latent_logger.finalize()
+        logger.info("[visualise] Latent state summaries saved to pred_latent/")
+
     if wandb: wandb.finish()
 
 

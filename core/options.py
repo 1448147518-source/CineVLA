@@ -29,6 +29,7 @@ class Options:
     # ── Music ──
     music_dim: int = 128
     music_seq_len: int = 30
+    music_ca_layers: int = 2            # top N planner layers with music cross-attn
 
     # ── Training ──
     batch_size: int = 4
@@ -53,9 +54,14 @@ class Options:
     text: Optional[str] = None
     music_path: Optional[str] = None
 
-    # ── Inference (closed-loop) ──
+    # ── Inference (closed-loop + CFG) ──
     closed_loop_steps: int = 30        # max closed-loop steps
     refinement_interval: int = 1       # refine every N steps
+    cfg_scale: float = 2.0            # classifier-free guidance scale for text
+
+    # ── Visualization ──
+    vis_latent: bool = False           # enable latent state PCA visualization
+    vis_latent_every: int = 100        # log latent state every N training steps
 
 
 config_defaults: Dict[str, Options] = {}

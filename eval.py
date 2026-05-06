@@ -22,6 +22,8 @@ from core.perception import VideoPerceptionEncoder
 from core.planner import Planner
 from core.refiner import Refiner
 from core.utils import slerp_trajectory
+from visualise.trajectory import plot_trajectory
+from visualise.latent import LatentLogger
 
 
 class CineVLAInference:
@@ -34,7 +36,9 @@ class CineVLAInference:
                                perception_dim=opt.perception_dim,
                                hidden_dim=opt.planner_hidden_dim,
                                num_layers=opt.planner_num_layers,
-                               num_heads=opt.planner_num_heads)
+                               num_heads=opt.planner_num_heads,
+                               music_ca_layers=opt.music_ca_layers,
+                               music_dim=opt.music_dim)
         self.refiner = Refiner(pose_dim=opt.pose_dim, perception_dim=opt.perception_dim,
                                hidden_dim=opt.refiner_hidden_dim,
                                num_layers=opt.refiner_num_layers,
@@ -119,15 +123,22 @@ class CineVLAInference:
         return torch.stack(frames).unsqueeze(0).to(self.device)
 
     @torch.no_grad()
-    def run(self, image_path, text, output_dir='outputs'):
+    def run(self, image_path, text, music_path=None, output_dir='outputs'):
         os.makedirs(output_dir, exist_ok=True)
 
-        # ── Phase 1: Plan ──
+        # ── Phase 1: Plan with CFG ──
         frames = self._load_frame_sequence(image_path)
         perc = self.perception(frames)
-        plan = self.planner.plan(perc, [text])
         text_feats = self.planner.encode_text([text])
-        print(f"[Planner] {plan.shape[0]} frames initial trajectory")
+
+        # Conditional trajectory (with text guidance)
+        cond_plan = self.planner.plan(perc, [text], music_path=music_path)
+        # Unconditional trajectory (empty text)
+        uncond_plan = self.planner.plan(perc, [''], music_path=music_path)
+        # CFG extrapolation
+        cfg_scale = getattr(self.opt, 'cfg_scale', 2.0)
+        plan = uncond_plan + cfg_scale * (cond_plan - uncond_plan)
+        print(f"[Planner] {plan.shape[0]} frames initial trajectory (CFG={cfg_scale})")
 
         # ── Phase 2: Closed-loop refinement ──
         trajectory = plan.clone()
@@ -135,10 +146,18 @@ class CineVLAInference:
         N = min(self.opt.closed_loop_steps, plan.shape[0])
         steps = []
 
+        latent_logger = None
+        if getattr(self.opt, 'vis_latent', False):
+            latent_logger = LatentLogger(save_dir='pred_latent')
+
         for t in range(N - 1):
             T = frames.shape[1]
             fi = min(int(t / N * T), T - 1)
             z_real = perc['features'][:, fi, :].squeeze(0)  # current frame feature
+
+            # Log latent state if visualization enabled
+            if latent_logger is not None:
+                latent_logger.log(z_real, z_pred, step=t, phase='infer')
 
             error = F.mse_loss(z_real, z_pred).item()
             if error > 0.01 and t < N - 1:
@@ -164,6 +183,21 @@ class CineVLAInference:
         np.save(os.path.join(output_dir, 'trajectory_dense.npy'), dense.cpu().numpy())
         json.dump(steps, open(os.path.join(output_dir, 'steps.json'), 'w'), indent=2)
         print(f"[Done] → {output_dir}/")
+
+        # ── Trajectory visualization (always) ──
+        plot_trajectory(
+            trajectory.cpu().numpy(),
+            dense=dense.cpu().numpy(),
+            steps=steps,
+            save_dir='results',
+            title=f'CineVLA — {text[:60]}'
+        )
+
+        # ── Latent visualization finalize ──
+        if latent_logger is not None:
+            latent_logger.finalize()
+            print(f"[visualise] Latent state plots saved to pred_latent/")
+
         return {'trajectory': trajectory, 'dense': dense}
 
 
@@ -180,7 +214,8 @@ def main():
     opt = tyro.cli(AllConfigs)
     engine = CineVLAInference(opt)
     engine.run(opt.image_path or 'input.jpg', opt.text or '',
-               os.path.join(opt.workspace, opt.exp_name or 'output'))
+               music_path=opt.music_path,
+               output_dir=os.path.join(opt.workspace, opt.exp_name or 'output'))
 
 
 if __name__ == '__main__':

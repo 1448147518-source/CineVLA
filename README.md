@@ -9,7 +9,7 @@ CineVLA 是一个闭环视觉-语言-动作系统。模型在每一步运动后�
 
 ```
 Phase 1: 初始规划
-  RGB 帧序列 + 文本 → Video Perception → Planner → 初始轨迹
+  RGB 帧序列 + 文本 [+ 音乐] → Video Perception → Planner → 初始轨迹
 
 Phase 2: 闭环执行
   camera 走到 p_t → 捕捉当前帧
@@ -19,12 +19,15 @@ Phase 2: 闭环执行
   camera 走到修正后的 p_{t+1}
 ```
 
-## 三个组件
+音乐可选，仅在 Planner 顶层交叉注意力中注入节奏特征，使轨迹跟随节拍律动。
+
+## 组件
 
 | 组件 | 功能 |
 |------|------|
 | Video Perception | CLIP ViT-B/32 + 时序 Transformer，从 RGB 帧序列中提取 3D 感知特征 |
-| Planner | 因果 Transformer，从帧序列特征 + 文本生成初始轨迹 |
+| Planner | 因果 Transformer，从帧序列特征 + 文本 + 音乐节奏生成初始轨迹 |
+| Music Encoder | librosa 提取 BPM/节拍/onset，编码为 30 帧节奏特征 |
 | Refiner | 轻量 Transformer，用真实帧特征 vs 预测特征的误差修正轨迹 |
 
 ## 安装
@@ -44,13 +47,15 @@ python train.py default --workspace workspace --exp_name run1
 ## 推理
 
 ```bash
-# 单张图片
+# 单张图片（不含音乐）
 python eval.py default --image_path "scene.jpg" --text "镜头推进..." --resume "ckpt.safetensors"
 
-# 帧序列目录
-python eval.py default --image_path "frames/" --text "..." --resume "ckpt.safetensors"
+# 带音乐律动（舞蹈拍摄等场景）
+python eval.py default --image_path "scene.jpg" --text "..." \
+    --music_path "bgm.mp3" --resume "ckpt.safetensors"
 
-# MP4 视频
+# 帧序列 / MP4 视频
+python eval.py default --image_path "frames/" --text "..." --resume "ckpt.safetensors"
 python eval.py default --image_path "video.mp4" --text "..." --resume "ckpt.safetensors"
 ```
 
@@ -63,7 +68,8 @@ dataset/
 │   ├── shot_0070_rgb.png        # 第一帧 RGB 图像（任意分辨率，训练时 resize 到 224×224）
 │   ├── shot_0070_caption.json   # 文本描述
 │   ├── shot_0070_transforms_cleaning.json  # 相机轨迹
-│   └── shot_0070_frames/        # （可选）多帧序列目录
+│   ├── shot_0070_music.mp3       # （可选）音乐文件
+│   └── shot_0070_frames/         # （可选）多帧序列目录
 │       ├── 000.png
 │       ├── 001.png
 │       └── ...
