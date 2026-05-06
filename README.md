@@ -83,6 +83,9 @@ python -m evaluate.eval_benchmark --resume ckpt.safetensors --data_path DataDoP/
 | `clatr/density` | 真实流形邻域内生成样本密度 |
 | `clatr/coverage` | 真实样本被生成样本覆盖的比例 |
 | `clatr/clatr_score` | 轨迹-文本余弦对齐度（0–100，越高越好） |
+| `captions/precision` | 运动模式分割精确率 — 生成轨迹中正确复现 GT 运动模式的比例 |
+| `captions/recall` | 运动模式分割召回率 — GT 运动模式被生成轨迹覆盖的比例 |
+| `captions/fscore` | 运动模式分割 F1 分数 |
 
 结果输出：`./metrics/benchmark.csv`
 
@@ -204,4 +207,8 @@ dataset/
 **`_video.mp4` 文件（与 `_frames/` 二选一）**
 
 MP4 视频文件，自动等距抽取 8 帧。视频总帧数必须 ≥ 8，否则报错退出。若同时存在 `_video.mp4` 和 `_frames/`，优先使用视频。
+
+---
+
+> **README 维护约定**：所有新增功能均需同步更新本文档。命令行参数、模块结构、输出路径等如有变动，须在对应章节反映。
 

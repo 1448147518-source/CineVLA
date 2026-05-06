@@ -154,11 +154,16 @@ def run_benchmark(opt: BenchmarkOptions):
                     z_pred = z_pred_next.unsqueeze(0)
 
         # ── Extract features ──
-        gen_feat = traj_encoder(trajectory.unsqueeze(0)).squeeze(0)   # [256]
-        ref_feat = traj_encoder(gt_poses.unsqueeze(0)).squeeze(0)     # [256]
+        gen_feat = traj_encoder(trajectory.unsqueeze(0)).squeeze(0)   # [768]
+        ref_feat = traj_encoder(gt_poses.unsqueeze(0)).squeeze(0)     # [768]
         txt_feat = text_feats.mean(dim=1).squeeze(0)                  # [768]
 
-        metrics.add(gen_feat, ref_feat, txt_feat)
+        # Convert to [N, 3, 4] for caption metrics
+        traj_34 = trajectory_7d_to_34(trajectory)
+        gt_34 = trajectory_7d_to_34(gt_poses)
+
+        metrics.add(gen_feat, ref_feat, txt_feat,
+                    traj_34_gen=traj_34, traj_34_ref=gt_34)
 
         if (idx + 1) % 10 == 0:
             print(f"[benchmark] {idx + 1}/{len(ds)} samples processed")
