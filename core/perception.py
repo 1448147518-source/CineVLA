@@ -1,143 +1,106 @@
 """
-Perception Encoder — runs at every closed-loop step.
-Encodes a real RGB image into an environment latent z_t [perception_dim].
+Video Perception Encoder — extracts 3D-aware features from RGB frame sequences.
 
-Uses a frozen CLIP ViT-B/32 backbone for efficiency, with a learnable
-projection head that adapts the features for trajectory refinement.
+Architecture:
+  1. Per-frame: frozen CLIP ViT-B/32 extracts 512-dim features
+  2. Temporal: lightweight transformer aggregates across frames
+  3. Output: per-frame latents [T, dim] with cross-frame 3D understanding
+
+No depth maps required. The model learns multi-view geometry implicitly
+from RGB frame sequences, similar to monocular 3D reconstruction methods.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from functools import partial
 
 
-class PerceptionEncoder(nn.Module):
+class VideoPerceptionEncoder(nn.Module):
     """
-    Encode RGB image → environment latent z_t.
+    Encode an RGB frame sequence into per-frame environment latents.
 
-    Backbone: frozen CLIP ViT-B/32 (lightweight, 512-dim output)
-    Projection: 2-layer MLP with LayerNorm
+    Input:  [B, T, 3, H, W] frame sequence (T >= 1)
+    Output: [B, T, dim] per-frame latents with temporal 3D context
     """
 
-    def __init__(self, dim: int = 512, image_size: int = 224, freeze_backbone: bool = True):
+    def __init__(self, dim: int = 512, image_size: int = 224, freeze_backbone: bool = True,
+                 temporal_layers: int = 3, temporal_heads: int = 4):
         super().__init__()
         self.dim = dim
         self.image_size = image_size
 
-        # ── Backbone: CLIP ViT-B/32 ──
+        # ── Frame-level encoder: CLIP ViT-B/32 ──
         import clip
-        self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device="cpu")
-        self.clip_model = self.clip_model.visual  # only vision part
-
+        self.clip_model, _ = clip.load("ViT-B/32", device="cpu")
+        self.clip_model = self.clip_model.visual
         if freeze_backbone:
             self.clip_model.eval()
             for p in self.clip_model.parameters():
                 p.requires_grad = False
 
-        # ── Projection head ──
-        self.proj = nn.Sequential(
-            nn.LayerNorm(512),
-            nn.Linear(512, dim),
-            nn.GELU(),
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
+        # ── Per-frame projection ──
+        self.frame_proj = nn.Sequential(
+            nn.LayerNorm(512), nn.Linear(512, dim), nn.GELU(), nn.Linear(dim, dim),
         )
 
+        # ── Temporal aggregator ──
+        self.temporal_pos = nn.Parameter(torch.randn(1, 64, dim) * 0.02)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim, nhead=temporal_heads, dim_feedforward=dim * 4,
+            dropout=0.1, batch_first=True, activation='gelu',
+        )
+        self.temporal = nn.TransformerEncoder(encoder_layer, num_layers=temporal_layers)
+        self.temporal_norm = nn.LayerNorm(dim)
+
     @torch.no_grad()
-    def _extract_clip_features(self, images: torch.Tensor) -> torch.Tensor:
-        """Extract CLIP features from batch of images [B, 3, H, W]."""
-        if images.shape[-1] != 224 or images.shape[-2] != 224:
-            images = F.interpolate(images, (224, 224), mode='bilinear', align_corners=False)
-        return self.clip_model(images)  # [B, 512]
+    def _clip_features(self, frames: torch.Tensor) -> torch.Tensor:
+        """frames: [B*T, 3, H, W] → [B*T, 512]"""
+        if frames.shape[-1] != 224:
+            frames = F.interpolate(frames, (224, 224), mode='bilinear', align_corners=False)
+        return self.clip_model(frames)
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def forward(self, frames: torch.Tensor) -> dict:
         """
-        Encode real camera image into environment latent.
-
         Args:
-            images: [B, 3, H, W] RGB in [0, 1]
+            frames: [B, T, 3, H, W] RGB frame sequence
 
         Returns:
-            z: [B, dim] environment perception latent
+            dict with:
+              'features':   [B, T, dim] per-frame latents (temporal-contextualized)
+              'global':     [B, dim]    pooled global scene representation
+              'features_0': [B, dim]    first-frame feature (before temporal)
         """
-        features = self._extract_clip_features(images)
-        z = self.proj(features)
-        return z
+        B, T = frames.shape[:2]
+        device = frames.device
+
+        # Per-frame CLIP
+        flat = frames.reshape(B * T, *frames.shape[2:])
+        clip_feats = self._clip_features(flat)  # [B*T, 512]
+        feats = self.frame_proj(clip_feats)      # [B*T, dim]
+        feats = feats.reshape(B, T, self.dim)    # [B, T, dim]
+
+        # Save first-frame raw feature (used by Planner as initial perception)
+        features_0 = feats[:, 0, :]
+
+        # Add temporal positional encoding
+        feats = feats + self.temporal_pos[:, :T, :]
+
+        # Temporal aggregation
+        feats = self.temporal(feats)
+        feats = self.temporal_norm(feats)  # [B, T, dim]
+
+        # Global scene embedding (mean pool over time)
+        global_feat = feats.mean(dim=1)  # [B, dim]
+
+        return {
+            'features': feats,
+            'global': global_feat,
+            'features_0': features_0,
+        }
 
     @torch.no_grad()
-    def perceive(self, image: torch.Tensor) -> torch.Tensor:
-        """Inference wrapper: single image → latent."""
+    def encode_frame(self, image: torch.Tensor) -> torch.Tensor:
+        """Single-frame inference: image [3, H, W] → latent [dim]."""
         if image.dim() == 3:
-            image = image.unsqueeze(0)
-        return self.forward(image)
-
-
-# ─────────────────────────────────────────────────────────────
-#  Viewpoint warper — for training data synthesis
-# ─────────────────────────────────────────────────────────────
-
-
-def warp_viewpoint(
-    source_rgb: torch.Tensor,
-    source_depth: torch.Tensor,
-    source_pose: torch.Tensor,    # [4, 4] c2w matrix
-    target_pose: torch.Tensor,    # [4, 4] c2w matrix
-    intrinsics: torch.Tensor,     # [fx, fy, cx, cy]
-    image_size: int = 224,
-) -> torch.Tensor:
-    """
-    Synthesize the view at target_pose from a single source image + depth.
-
-    Uses simple depth-based 3D warping (no learned inpainting).
-    This produces approximate intermediate views for training the Refiner.
-
-    Returns:
-        warped_rgb: [3, image_size, image_size]
-    """
-    H, W = source_rgb.shape[-2], source_rgb.shape[-1]
-    device = source_rgb.device
-
-    # Camera intrinsics
-    fx, fy, cx, cy = intrinsics.unbind(-1)
-
-    # Pixel coordinate grid
-    u = torch.arange(W, device=device).float()
-    v = torch.arange(H, device=device).float()
-    uu, vv = torch.meshgrid(u, v, indexing='xy')
-    uu, vv = uu.flatten(), vv.flatten()
-
-    # Unproject to 3D world coordinates
-    depth = source_depth.flatten()
-    X = (uu - cx) * depth / fx
-    Y = (vv - cy) * depth / fy
-    Z = depth
-    points_3d_cam = torch.stack([X, Y, Z, torch.ones_like(Z)], dim=0)  # [4, H*W]
-
-    # Transform from source camera to world, then to target camera
-    T_world_from_src = source_pose  # c2w
-    T_cam_from_world = torch.inverse(target_pose)  # w2c
-    points_3d_target = T_cam_from_world @ T_world_from_src @ points_3d_cam
-    points_3d_target = points_3d_target[:3]  # [3, H*W]
-
-    # Project to target image plane
-    Xt, Yt, Zt = points_3d_target[0], points_3d_target[1], points_3d_target[2]
-    valid = Zt > 1e-6
-    ut = (Xt / Zt.clamp(min=1e-6)) * fx + cx
-    vt = (Yt / Zt.clamp(min=1e-6)) * fy + cy
-    ut = ut.clamp(0, W - 1).long()
-    vt = vt.clamp(0, H - 1).long()
-
-    # Scatter warp
-    warped = torch.zeros(3, H, W, device=device)
-    colors = source_rgb.reshape(3, -1)
-    valid_mask = valid & (ut >= 0) & (ut < W) & (vt >= 0) & (vt < H)
-    idx = vt[valid_mask] * W + ut[valid_mask]
-    warped_flat = warped.reshape(3, -1)
-    warped_flat[:, idx] = colors[:, valid_mask]
-
-    if image_size != H:
-        warped = F.interpolate(warped.unsqueeze(0), (image_size, image_size),
-                               mode='bilinear', align_corners=False).squeeze(0)
-
-    return warped
+            image = image.unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
+        return self.forward(image)['global'][0]

@@ -1,29 +1,26 @@
 """
-CineVLA v3 Closed-Loop Inference
+CineVLA v3.1 Inference — RGB frame sequence → camera trajectory.
 
-Pipeline:
-  1. Planner: image_0 + text → initial trajectory [p_1 ... p_N]
-  2. Loop for t = 0, 1, 2, ... N:
-     a. Capture image_t at current pose p_t
-     b. Perception → z_t (real environment latent)
-     c. Compare z_t vs predicted ẑ_t → error
-     d. Refiner → refined remaining trajectory + predicted ẑ_{t+1}
-     e. Move to refined p_{t+1}
+Supports:
+  - Single image: creates synthetic frame sequence via augmentations
+  - Frame directory: loads multiple PNG frames
+  - MP4 video: extracts frames automatically
 
 Usage:
   python eval.py default --image_path "scene.jpg" --text "..." --resume "ckpt.safetensors"
+  python eval.py default --image_path "frames/" --text "..." --resume "ckpt.safetensors"
+  python eval.py default --image_path "video.mp4" --text "..." --resume "ckpt.safetensors"
 """
 
-import os, json, time
+import os, json, time, glob, random
 import cv2, numpy as np
 import torch, tyro
 import torch.nn.functional as F
 
 from core.options import AllConfigs
-from core.perception import PerceptionEncoder
+from core.perception import VideoPerceptionEncoder
 from core.planner import Planner
 from core.refiner import Refiner
-from core.music_encoder import MusicEncoder
 from core.utils import slerp_trajectory
 
 
@@ -32,136 +29,158 @@ class CineVLAInference:
         self.opt = opt
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        self.perception = PerceptionEncoder(opt.perception_dim, opt.image_size)
-        self.planner = Planner(
-            pose_dim=opt.pose_dim, pose_length=opt.pose_length,
-            perception_dim=opt.perception_dim,
-            hidden_dim=opt.planner_hidden_dim,
-            num_layers=opt.planner_num_layers,
-            num_heads=opt.planner_num_heads,
-        )
-        self.refiner = Refiner(
-            pose_dim=opt.pose_dim,
-            perception_dim=opt.perception_dim,
-            hidden_dim=opt.refiner_hidden_dim,
-            num_layers=opt.refiner_num_layers,
-            num_heads=opt.refiner_num_heads,
-        )
-        self.music = MusicEncoder(dim=opt.music_dim, seq_len=opt.music_seq_len)
+        self.perception = VideoPerceptionEncoder(opt.perception_dim, opt.image_size)
+        self.planner = Planner(pose_dim=opt.pose_dim, pose_length=opt.pose_length,
+                               perception_dim=opt.perception_dim,
+                               hidden_dim=opt.planner_hidden_dim,
+                               num_layers=opt.planner_num_layers,
+                               num_heads=opt.planner_num_heads)
+        self.refiner = Refiner(pose_dim=opt.pose_dim, perception_dim=opt.perception_dim,
+                               hidden_dim=opt.refiner_hidden_dim,
+                               num_layers=opt.refiner_num_layers,
+                               num_heads=opt.refiner_num_heads)
 
         if opt.resume:
             from safetensors.torch import load_file
             ckpt = load_file(opt.resume) if opt.resume.endswith('.safetensors') \
                 else torch.load(opt.resume, map_location='cpu')
-            self.perception.load_state_dict({k.replace('perception.', ''): v for k, v in ckpt.items() if k.startswith('perception.')}, strict=False)
-            self.planner.load_state_dict({k.replace('planner.', ''): v for k, v in ckpt.items() if k.startswith('planner.')}, strict=False)
-            self.refiner.load_state_dict({k.replace('refiner.', ''): v for k, v in ckpt.items() if k.startswith('refiner.')}, strict=False)
+            for name, model in [('perception', self.perception), ('planner', self.planner),
+                                 ('refiner', self.refiner)]:
+                sub = {k.replace(f'{name}.', ''): v for k, v in ckpt.items() if k.startswith(f'{name}.')}
+                model.load_state_dict(sub, strict=False)
+            print(f"[INFO] Loaded checkpoint from {opt.resume}")
 
         self.perception = self.perception.eval().to(device)
         self.planner = self.planner.eval().to(device)
         self.refiner = self.refiner.eval().to(device)
         self.device = device
 
-    def _load_image(self, path):
-        img = cv2.imread(path, cv2.IMREAD_UNCHANGED).astype(np.float32) / 255.
-        img = img[..., [2, 1, 0]]
-        t = torch.from_numpy(img).permute(2, 0, 1).float()
-        h, w = t.shape[1], t.shape[2]
-        if h > 224: t = t[:, (h - 224) // 2: (h - 224) // 2 + 224, :]
-        if w > 224: t = t[:, :, (w - 224) // 2: (w - 224) // 2 + 224]
-        return t.unsqueeze(0).to(self.device)  # [1, 3, 224, 224]
+    def _load_frame_sequence(self, path, num_frames=8):
+        """Load T frames from image, directory, or video."""
+        path = str(path)
+        Ht = Wt = 224
+
+        def _load_one(p):
+            img = cv2.imread(p, cv2.IMREAD_UNCHANGED).astype(np.float32) / 255.
+            img = img[..., [2, 1, 0]]
+            t = torch.from_numpy(img).permute(2, 0, 1).float()
+            h, w = t.shape[1], t.shape[2]
+            if h > Ht: t = t[:, (h - Ht) // 2:(h - Ht) // 2 + Ht, :]
+            if w > Wt: t = t[:, :, (w - Wt) // 2:(w - Wt) // 2 + Wt]
+            return t
+
+        # ── Directory of frames ──
+        if os.path.isdir(path):
+            files = sorted(glob.glob(os.path.join(path, '*.png')) +
+                           glob.glob(os.path.join(path, '*.jpg')))[:num_frames]
+            if files:
+                frames = torch.stack([_load_one(f) for f in files])
+                if len(frames) < num_frames:
+                    pad = frames[-1:].repeat(num_frames - len(frames), 1, 1, 1)
+                    frames = torch.cat([frames, pad])
+                return frames.unsqueeze(0).to(self.device)
+
+        # ── Video file ──
+        if path.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+            cap = cv2.VideoCapture(path)
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total > 0:
+                indices = np.linspace(0, total - 1, num_frames, dtype=int)
+                frames = []
+                for i in indices:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+                    ret, frame = cap.read()
+                    if not ret: break
+                    frame = frame.astype(np.float32) / 255.
+                    frame = frame[..., [2, 1, 0]]
+                    t = torch.from_numpy(frame).permute(2, 0, 1).float()
+                    h, w = t.shape[1], t.shape[2]
+                    if h > Ht: t = t[:, (h - Ht) // 2:(h - Ht) // 2 + Ht, :]
+                    if w > Wt: t = t[:, :, (w - Wt) // 2:(w - Wt) // 2 + Wt]
+                    frames.append(t)
+                cap.release()
+                if len(frames) >= 2:
+                    while len(frames) < num_frames: frames.append(frames[-1])
+                    return torch.stack(frames[:num_frames]).unsqueeze(0).to(self.device)
+
+        # ── Single image: create synthetic sequence ──
+        img = _load_one(path)
+        frames = [img]
+        for _ in range(num_frames - 1):
+            aug = img.clone()
+            s = random.uniform(0.85, 0.98)
+            h, w = int(224 * s), int(224 * s)
+            y, x = random.randint(0, 224 - h), random.randint(0, 224 - w)
+            patch = aug[:, y:y + h, x:x + w]
+            aug = F.interpolate(patch.unsqueeze(0), (224, 224), mode='bilinear',
+                                align_corners=False).squeeze(0)
+            aug = torch.clamp(aug * random.uniform(0.8, 1.2) + random.uniform(-0.05, 0.05), 0, 1)
+            frames.append(aug)
+        return torch.stack(frames).unsqueeze(0).to(self.device)
 
     @torch.no_grad()
-    def run(self, image_path: str, text: str, music_path: str = None,
-            output_dir: str = 'outputs') -> dict:
-        """
-        Run full closed-loop inference.
-
-        In real deployment, images at steps t>0 would come from the camera.
-        Here we simulate by starting from the initial frame only.
-        """
+    def run(self, image_path, text, output_dir='outputs'):
         os.makedirs(output_dir, exist_ok=True)
 
-        # ── Phase 1: Initial Planning ──
-        img_0 = self._load_image(image_path)
-        z_0 = self.perception(img_0)  # [1, perception_dim]
-        music_feats = self.music(music_path, self.device) if music_path else None
-        plan = self.planner.plan(z_0, [text], music_feats)  # [N, 7]
-
+        # ── Phase 1: Plan ──
+        frames = self._load_frame_sequence(image_path)
+        perc = self.perception(frames)
+        plan = self.planner.plan(perc, [text])
         text_feats = self.planner.encode_text([text])
+        print(f"[Planner] {plan.shape[0]} frames initial trajectory")
 
-        print(f"[Planner] Initial trajectory: {plan.shape[0]} frames")
-
-        # ── Phase 2: Closed-Loop Refinement ──
+        # ── Phase 2: Closed-loop refinement ──
         trajectory = plan.clone()
-        z_pred = z_0  # initial prediction
+        z_pred = perc['features_0']  # initial prediction
         N = min(self.opt.closed_loop_steps, plan.shape[0])
-        step_results = []
+        steps = []
 
         for t in range(N - 1):
-            # In real deployment: capture image_t from camera at pose trajectory[t]
-            # Here: use initial frame as proxy (simulated closed-loop)
-            z_real = self.perception(img_0)  # would be: perception(camera_capture())
+            T = frames.shape[1]
+            fi = min(int(t / N * T), T - 1)
+            z_real = perc['features'][:, fi, :].squeeze(0)  # current frame feature
 
-            # Check if refinement needed
             error = F.mse_loss(z_real, z_pred).item()
             if error > 0.01 and t < N - 1:
                 remaining = trajectory[t + 1:]
-                # Ensure at least 1 frame remaining
                 if remaining.shape[0] > 0:
-                    refined_remaining, z_pred_next = self.refiner.refine(
-                        z_real.squeeze(0), z_pred.squeeze(0),
-                        remaining, text_feats.squeeze(0),
-                    )
-                        # Replace remaining trajectory with refined version
-                    trajectory[t + 1:] = refined_remaining
+                    refined, z_pred_next = self.refiner.refine(
+                        z_real, z_pred, remaining, text_feats.squeeze(0))
+                    trajectory[t + 1:] = refined
                     z_pred = z_pred_next.unsqueeze(0)
-                    print(f"  Step {t}: refined {remaining.shape[0]} frames, error={error:.4f}")
+                    print(f"  Step {t}: refined {remaining.shape[0]} frames, err={error:.4f}")
 
-            step_results.append({
-                'step': t,
-                'pose': trajectory[t].cpu().tolist(),
-                'perception_error': error,
-            })
+            steps.append({'step': t, 'pose': trajectory[t].tolist(), 'error': error})
 
         # ── Output ──
-        # SLERP to dense trajectory
         poses_34 = torch.zeros(trajectory.shape[0], 3, 4)
         for i, p in enumerate(trajectory):
-            R = quaternion_to_matrix_pt(p[:4])
+            R = _q2r(p[:4])
             poses_34[i, :, :3] = R
             poses_34[i, :, 3] = p[4:7]
         dense = slerp_trajectory(poses_34, self.opt.dense_frames)
 
         np.save(os.path.join(output_dir, 'trajectory.npy'), trajectory.cpu().numpy())
         np.save(os.path.join(output_dir, 'trajectory_dense.npy'), dense.cpu().numpy())
-
-        with open(os.path.join(output_dir, 'steps.json'), 'w') as f:
-            json.dump(step_results, f, indent=2)
-
-        print(f"[Done] Trajectory saved to {output_dir}/")
-        return {'trajectory': trajectory, 'dense': dense, 'steps': step_results}
+        json.dump(steps, open(os.path.join(output_dir, 'steps.json'), 'w'), indent=2)
+        print(f"[Done] → {output_dir}/")
+        return {'trajectory': trajectory, 'dense': dense}
 
 
-def quaternion_to_matrix_pt(q):
-    """Single quaternion → 3x3 rotation matrix."""
-    w, x, y, z = q.unbind(-1)
-    return torch.stack([
-        torch.stack([1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)]),
-        torch.stack([2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)]),
-        torch.stack([2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)]),
-    ], dim=-2)
+def _q2r(q):
+    w, x, y, z = q
+    return torch.tensor([
+        [1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+        [2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+        [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)],
+    ])
 
 
 def main():
     opt = tyro.cli(AllConfigs)
     engine = CineVLAInference(opt)
-    engine.run(
-        image_path=opt.image_path or 'assets/scene.jpg',
-        text=opt.text or 'Camera moves forward smoothly.',
-        music_path=opt.music_path,
-        output_dir=os.path.join(opt.workspace, opt.exp_name or 'output'),
-    )
+    engine.run(opt.image_path or 'input.jpg', opt.text or '',
+               os.path.join(opt.workspace, opt.exp_name or 'output'))
 
 
 if __name__ == '__main__':

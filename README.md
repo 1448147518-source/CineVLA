@@ -2,33 +2,29 @@
 
 CineVLA 是一个闭环视觉-语言-动作系统。模型在每一步运动后真正"看一眼"附近的 RGB 环境，用这个真实的视觉信号来修正后续轨迹。
 
+**全程无需深度图输入。**
+
 ## 架构
 
 ```
 Phase 1: 初始规划
-  image_0 + text + music → Planner → 初始轨迹 [p₁...p₃₀]
+  RGB 帧序列 + 文本 → Video Perception → Planner → 初始轨迹
 
-Phase 2: 闭环执行（每步循环）
-  camera 走到 p_t
-    ↓
-  捕捉 image_t（真实环境 RGB）
-    ↓
-  Perception Encoder → z_t（真实感知）
-    ↓
-  比较 z_t vs 预测的 ẑ_t → 感知误差
-    ↓
-  Refiner → 修正剩余轨迹 + 预测下一帧环境
-    ↓
-  camera 走到 refined p_{t+1}
+Phase 2: 闭环执行
+  camera 走到 p_t → 捕捉当前帧
+  Perception(当前帧) → z_t（真实环境感知）
+  z_t vs 预测的 ẑ_t → 感知误差
+  Refiner → 修正剩余轨迹 + 预测下一帧状态
+  camera 走到修正后的 p_{t+1}
 ```
 
 ## 三个组件
 
 | 组件 | 功能 |
 |------|------|
-| Perception Encoder | CLIP ViT-B/32，每步编码当前摄像头 RGB → 环境潜在向量 z |
-| Planner | 因果 Transformer，从初始帧 + 文本 + 音乐生成初始轨迹 |
-| Refiner | 轻量 Transformer，用真实感知 vs 预测感知的误差修正后续轨迹 |
+| Video Perception | CLIP ViT-B/32 + 时序 Transformer，从 RGB 帧序列中提取 3D 感知特征 |
+| Planner | 因果 Transformer，从帧序列特征 + 文本生成初始轨迹 |
+| Refiner | 轻量 Transformer，用真实帧特征 vs 预测特征的误差修正轨迹 |
 
 ## 安装
 
@@ -41,20 +37,72 @@ pip install -r requirements.txt --break-system-packages
 ## 训练
 
 ```bash
-# 三阶段：Planner → Refiner → Joint
-accelerate launch --config_file acc_configs/gpu1.yaml train.py default \
-    --workspace workspace --exp_name run1
+python train.py default --workspace workspace --exp_name run1
 ```
 
 ## 推理
 
 ```bash
-python eval.py default \
-    --resume "workspace/run1/model.safetensors" \
-    --image_path "scene.jpg" \
-    --text "镜头缓缓推进... "
+# 单张图片
+python eval.py default --image_path "scene.jpg" --text "镜头推进..." --resume "ckpt.safetensors"
+
+# 帧序列目录
+python eval.py default --image_path "frames/" --text "..." --resume "ckpt.safetensors"
+
+# MP4 视频
+python eval.py default --image_path "video.mp4" --text "..." --resume "ckpt.safetensors"
 ```
 
-## 数据格式
+## 数据集结构
 
-每个样本需要：`_rgb.png` + `_depth.npy` + `_caption.json` + `_transforms_cleaning.json`
+```
+dataset/
+├── train_valid.txt              # 一行一个样本路径: {VideoID}/{ShotID}
+├── 1_0000/                      # VideoID 目录
+│   ├── shot_0070_rgb.png        # 第一帧 RGB 图像（任意分辨率，训练时 resize 到 224×224）
+│   ├── shot_0070_caption.json   # 文本描述
+│   ├── shot_0070_transforms_cleaning.json  # 相机轨迹
+│   └── shot_0070_frames/        # （可选）多帧序列目录
+│       ├── 000.png
+│       ├── 001.png
+│       └── ...
+├── 1_0001/
+│   └── ...
+└── ...
+```
+
+### 文件格式
+
+**`_caption.json`**
+
+```json
+{
+    "Movement": "相机右移后上仰...",
+    "Detailed Interaction": "...",
+    "Concise Interaction": "简洁的导演意图描述"
+}
+```
+
+训练时随机选一个 key，优先 `Concise Interaction`。
+
+**`_transforms_cleaning.json`**
+
+```json
+{
+    "w": 1920,
+    "h": 1080,
+    "fl_x": 1200.0, "fl_y": 1200.0,
+    "cx": 960.0,  "cy": 540.0,
+    "frames": [
+        {"transform_matrix": [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]},
+        ...
+    ]
+}
+```
+
+`frames` 数组至少 120 帧（等距采样 30 帧做轨迹）。`transform_matrix` 为 4×4 c2w 矩阵。
+
+**`_frames/` 目录（可选）**
+
+放多个 PNG 帧文件（文件名排序后按序读取，取前 8 帧）。如果不存在该目录，训练时自动通过随机裁剪 + 亮度扰动从单帧生成伪多帧序列。
+
