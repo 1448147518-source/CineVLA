@@ -13,6 +13,7 @@ class Options:
     # ── Perception ──
     perception_dim: int = 512          # environment latent dimension
     image_size: int = 224              # perception encoder input size
+    num_frames: int = 8               # input frame sequence length
 
     # ── Planner ──
     planner_hidden_dim: int = 256

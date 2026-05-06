@@ -47,17 +47,18 @@ python train.py default --workspace workspace --exp_name run1
 ## 推理
 
 ```bash
-# 单张图片（不含音乐）
-python eval.py default --image_path "scene.jpg" --text "镜头推进..." --resume "ckpt.safetensors"
+# 帧序列目录
+python eval.py default --image_path "shot_0070_frames/" --text "镜头推进..." --resume "ckpt.safetensors"
+
+# MP4 视频
+python eval.py default --image_path "shot_0070_video.mp4" --text "镜头推进..." --resume "ckpt.safetensors"
 
 # 带音乐律动（舞蹈拍摄等场景）
-python eval.py default --image_path "scene.jpg" --text "..." \
+python eval.py default --image_path "frames/" --text "..." \
     --music_path "bgm.mp3" --resume "ckpt.safetensors"
-
-# 帧序列 / MP4 视频
-python eval.py default --image_path "frames/" --text "..." --resume "ckpt.safetensors"
-python eval.py default --image_path "video.mp4" --text "..." --resume "ckpt.safetensors"
 ```
+
+注意：推理不再支持单张图片输入。请使用 `_frames/` 目录或 `.mp4` 视频文件。
 
 ## 可视化
 
@@ -123,7 +124,8 @@ dataset/
 │   ├── shot_0070_caption.json   # 文本描述
 │   ├── shot_0070_transforms_cleaning.json  # 相机轨迹
 │   ├── shot_0070_music.mp3       # （可选）音乐文件
-│   └── shot_0070_frames/         # （可选）多帧序列目录
+│   ├── shot_0070_video.mp4       # 视频文件（与 _frames/ 二选一，同时存在优先 video）
+│   └── shot_0070_frames/         # 多帧序列目录（与 video 二选一）
 │       ├── 000.png
 │       ├── 001.png
 │       └── ...
@@ -131,6 +133,8 @@ dataset/
 │   └── ...
 └── ...
 ```
+
+每个样本**必须**包含 `_video.mp4` 或 `_frames/` 目录之一（两者都有时优先使用 video）。不再支持从单张图片生成伪序列的降级模式；缺少两者时训练/推理直接报错退出。
 
 ### 文件格式
 
@@ -163,7 +167,11 @@ dataset/
 
 `frames` 数组至少 120 帧（等距采样 30 帧做轨迹）。`transform_matrix` 为 4×4 c2w 矩阵。
 
-**`_frames/` 目录（可选）**
+**`_frames/` 目录**
 
-放多个 PNG 帧文件（文件名排序后按序读取，取前 8 帧）。如果不存在该目录，训练时自动通过随机裁剪 + 亮度扰动从单帧生成伪多帧序列。
+放多个 PNG 帧文件（文件名排序后按序读取，取前 8 帧）。必须至少包含 8 帧，不足则报错退出。不进行任何补帧或伪序列生成。
+
+**`_video.mp4` 文件（与 `_frames/` 二选一）**
+
+MP4 视频文件，自动等距抽取 8 帧。视频总帧数必须 ≥ 8，否则报错退出。若同时存在 `_video.mp4` 和 `_frames/`，优先使用视频。
 

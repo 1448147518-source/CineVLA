@@ -140,7 +140,7 @@ def main():
 
     ds = CineVLADataset(opt.data_path, split_txt='DataDoP/train_valid.txt',
                          pose_length=opt.pose_length, test_size=opt.test_size,
-                         num_frames=8)
+                         num_frames=opt.num_frames)
     dl = torch.utils.data.DataLoader(ds, batch_size=opt.batch_size, shuffle=True,
                                      num_workers=0 if device.type == 'cpu' else 2,
                                      pin_memory=(device.type == 'cuda'),

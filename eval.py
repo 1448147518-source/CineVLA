@@ -1,18 +1,17 @@
 """
 CineVLA v3.1 Inference — RGB frame sequence → camera trajectory.
 
-Supports:
-  - Single image: creates synthetic frame sequence via augmentations
-  - Frame directory: loads multiple PNG frames
-  - MP4 video: extracts frames automatically
+Supported inputs:
+  - Frame directory (_frames/): loads multiple PNG/JPG frames
+  - MP4 video: extracts evenly-spaced frames automatically
+  - Single images: NOT supported — use a _frames/ directory or video file
 
 Usage:
-  python eval.py default --image_path "scene.jpg" --text "..." --resume "ckpt.safetensors"
   python eval.py default --image_path "frames/" --text "..." --resume "ckpt.safetensors"
   python eval.py default --image_path "video.mp4" --text "..." --resume "ckpt.safetensors"
 """
 
-import os, json, time, glob, random
+import os, json, time, glob
 import cv2, numpy as np
 import torch, tyro
 import torch.nn.functional as F
@@ -60,7 +59,13 @@ class CineVLAInference:
         self.device = device
 
     def _load_frame_sequence(self, path, num_frames=8):
-        """Load T frames from image, directory, or video."""
+        """Load T frames: _frames/ directory or video file.  No single-image fallback.
+
+        Priority:
+          1. Directory of PNG/JPG files — real multi-view frames
+          2. MP4/AVI/MOV/MKV — auto-extract evenly-spaced frames
+          3. Anything else → RuntimeError (single images not supported)
+        """
         path = str(path)
         Ht = Wt = 224
 
@@ -77,57 +82,58 @@ class CineVLAInference:
         if os.path.isdir(path):
             files = sorted(glob.glob(os.path.join(path, '*.png')) +
                            glob.glob(os.path.join(path, '*.jpg')))[:num_frames]
-            if files:
-                frames = torch.stack([_load_one(f) for f in files])
-                if len(frames) < num_frames:
-                    pad = frames[-1:].repeat(num_frames - len(frames), 1, 1, 1)
-                    frames = torch.cat([frames, pad])
-                return frames.unsqueeze(0).to(self.device)
+            if not files:
+                raise RuntimeError(f"Frame directory is empty: {path}")
+            if len(files) < num_frames:
+                raise RuntimeError(
+                    f"Frame directory {path}: {len(files)} images found, "
+                    f"need >= {num_frames}"
+                )
+            frames = torch.stack([_load_one(f) for f in files])
+            return frames.unsqueeze(0).to(self.device)
 
         # ── Video file ──
         if path.endswith(('.mp4', '.avi', '.mov', '.mkv')):
             cap = cv2.VideoCapture(path)
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            if total > 0:
-                indices = np.linspace(0, total - 1, num_frames, dtype=int)
-                frames = []
-                for i in indices:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-                    ret, frame = cap.read()
-                    if not ret: break
-                    frame = frame.astype(np.float32) / 255.
-                    frame = frame[..., [2, 1, 0]]
-                    t = torch.from_numpy(frame).permute(2, 0, 1).float()
-                    h, w = t.shape[1], t.shape[2]
-                    if h > Ht: t = t[:, (h - Ht) // 2:(h - Ht) // 2 + Ht, :]
-                    if w > Wt: t = t[:, :, (w - Wt) // 2:(w - Wt) // 2 + Wt]
-                    frames.append(t)
+            if total < num_frames:
                 cap.release()
-                if len(frames) >= 2:
-                    while len(frames) < num_frames: frames.append(frames[-1])
-                    return torch.stack(frames[:num_frames]).unsqueeze(0).to(self.device)
+                raise RuntimeError(
+                    f"Video {path}: {total} frames total, need >= {num_frames}"
+                )
+            indices = np.linspace(0, total - 1, num_frames, dtype=int)
+            frames = []
+            for i in indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+                ret, frame = cap.read()
+                if not ret: break
+                frame = frame.astype(np.float32) / 255.
+                frame = frame[..., [2, 1, 0]]
+                t = torch.from_numpy(frame).permute(2, 0, 1).float()
+                h, w = t.shape[1], t.shape[2]
+                if h > Ht: t = t[:, (h - Ht) // 2:(h - Ht) // 2 + Ht, :]
+                if w > Wt: t = t[:, :, (w - Wt) // 2:(w - Wt) // 2 + Wt]
+                frames.append(t)
+            cap.release()
+            if len(frames) < num_frames:
+                raise RuntimeError(
+                    f"Video {path}: could only read {len(frames)}/{num_frames} frames"
+                )
+            return torch.stack(frames).unsqueeze(0).to(self.device)
 
-        # ── Single image: create synthetic sequence ──
-        img = _load_one(path)
-        frames = [img]
-        for _ in range(num_frames - 1):
-            aug = img.clone()
-            s = random.uniform(0.85, 0.98)
-            h, w = int(224 * s), int(224 * s)
-            y, x = random.randint(0, 224 - h), random.randint(0, 224 - w)
-            patch = aug[:, y:y + h, x:x + w]
-            aug = F.interpolate(patch.unsqueeze(0), (224, 224), mode='bilinear',
-                                align_corners=False).squeeze(0)
-            aug = torch.clamp(aug * random.uniform(0.8, 1.2) + random.uniform(-0.05, 0.05), 0, 1)
-            frames.append(aug)
-        return torch.stack(frames).unsqueeze(0).to(self.device)
+        # ── Unsupported ──
+        raise RuntimeError(
+            f"Unsupported input: {path}\n"
+            f"Provide a _frames/ directory or a video file (.mp4/.avi/.mov/.mkv). "
+            f"Single-image input is not supported."
+        )
 
     @torch.no_grad()
     def run(self, image_path, text, music_path=None, output_dir='outputs'):
         os.makedirs(output_dir, exist_ok=True)
 
         # ── Phase 1: Plan with CFG ──
-        frames = self._load_frame_sequence(image_path)
+        frames = self._load_frame_sequence(image_path, num_frames=self.opt.num_frames)
         perc = self.perception(frames)
         text_feats = self.planner.encode_text([text])
 
