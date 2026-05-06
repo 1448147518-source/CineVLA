@@ -60,6 +60,36 @@ python eval.py default --image_path "frames/" --text "..." \
 
 注意：推理不再支持单张图片输入。请使用 `_frames/` 目录或 `.mp4` 视频文件。
 
+## Benchmark 评估
+
+对测试集批量评估，计算 CLaTr 标准指标（FCD、PRDC、CLaTr Score），结果保存为 CSV。
+
+```bash
+python -m evaluate.eval_benchmark --resume ckpt.safetensors --data_path DataDoP/train
+```
+
+评估流程：
+1. 加载 CineVLA 模型权重
+2. 遍历测试集所有样本，逐个生成轨迹
+3. 用 `TrajectoryEncoder` 分别编码生成轨迹和 GT 轨迹，得到特征向量
+4. 用 CLIP 文本编码器提取文本特征
+5. 聚合全部样本特征，计算：
+
+| 指标 | 含义 |
+|------|------|
+| `clatr/fcd` | Frechet 距离 — 生成轨迹与真实轨迹的分布差异（越低越好） |
+| `clatr/precision` | 生成轨迹落在真实流形内的比例 |
+| `clatr/recall` | 真实轨迹被生成轨迹覆盖的比例 |
+| `clatr/density` | 真实流形邻域内生成样本密度 |
+| `clatr/coverage` | 真实样本被生成样本覆盖的比例 |
+| `clatr/clatr_score` | 轨迹-文本余弦对齐度（0–100，越高越好） |
+
+结果输出：`./metrics/benchmark.csv`
+
+### 自行训练 TrajectoryEncoder
+
+首次使用时 `TrajectoryEncoder` 为随机初始化，可添加训练损失使其学到更好的轨迹特征表示。将编码器权重保存为 `*_traj_enc.safetensors` 与 checkpoint 同名，评估脚本会自动加载。
+
 ## 可视化
 
 CineVLA 提供两个独立的可视化工具，位于 `visualise/` 目录下。
