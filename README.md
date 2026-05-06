@@ -59,6 +59,60 @@ python eval.py default --image_path "frames/" --text "..." --resume "ckpt.safete
 python eval.py default --image_path "video.mp4" --text "..." --resume "ckpt.safetensors"
 ```
 
+## 可视化
+
+CineVLA 提供两个独立的可视化工具，位于 `visualise/` 目录下。
+
+### 轨迹可视化（推理阶段自动开启）
+
+推理结束后自动生成，结果保存在 `./results/`：
+
+- `trajectory.png` — 3D 相机轨迹图，包含路径连线、相机坐标框架（RGB 三轴）、起止点标注、SLERP 稠密插值路径
+- `refinement_error.png` — 闭环修正过程中每步的感知误差（MSE），虚线标注 0.01 修正阈值
+
+```bash
+python eval.py default --image_path "scene.jpg" --text "镜头推进..." --resume "ckpt.safetensors"
+# 输出 → ./results/trajectory.png  +  refinement_error.png
+```
+
+### 潜态环境变化可视化（训练/推理可选）
+
+通过 PCA 将 512 维环境感知特征降至 2 维，对比模型预测的潜态 `z_pred` 与实际观测的 `z_real`。启用后结果保存在 `./pred_latent/`：
+
+- `latent_space.png` — PCA 二维散点图，z_real（蓝色圆）与 z_pred（红色叉）用灰线连接，左右分栏展示训练/推理阶段
+- `latent_error.png` — 预测误差（MSE）随时步变化，对数纵坐标
+
+**推理时启用：**
+
+```bash
+python eval.py default --image_path "scene.jpg" --text "..." --resume "ckpt.safetensors" --vis_latent
+```
+
+**训练时启用：**
+
+```bash
+python train.py default --workspace workspace --exp_name run1 \
+    --vis_latent --vis_latent_every 50
+```
+
+`--vis_latent_every` 控制每多少步记录一次潜态数据（默认 100），训练结束后自动生成 PCA 总结图。只有 refiner 预训练阶段和联合训练阶段会记录潜态（planner 预训练阶段不含 z_pred/z_real 对比）。
+
+### 输出目录
+
+```
+CineVLA/
+├── results/               # 轨迹可视化（推理时自动生成）
+│   ├── trajectory.png
+│   └── refinement_error.png
+├── pred_latent/           # 潜态可视化（--vis_latent 启用后生成）
+│   ├── latent_space.png
+│   └── latent_error.png
+└── visualise/             # 可视化源码
+    ├── __init__.py
+    ├── trajectory.py
+    └── latent.py
+```
+
 ## 数据集结构
 
 ```
