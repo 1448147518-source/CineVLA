@@ -21,7 +21,13 @@ class MusicEncoder(nn.Module):
 
     @torch.no_grad()
     def extract(self, path: str) -> torch.Tensor:
-        import librosa
+        try:
+            import librosa
+        except ImportError:
+            raise ImportError(
+                "librosa is required for music encoding. "
+                "Install it with: pip install librosa"
+            )
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             y, sr = librosa.load(path, sr=22050, duration=30.0)

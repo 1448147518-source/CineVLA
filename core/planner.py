@@ -11,8 +11,6 @@ enabling beat-synchronized camera movement for dance/concert filming.
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from functools import partial
 from contextlib import nullcontext
 from typing import Optional
 
@@ -48,7 +46,6 @@ class Planner(nn.Module):
 
         # ── Trajectory queries ──
         self.traj_queries = nn.Parameter(torch.randn(1, pose_length, hidden_dim) * 0.02)
-        self.z_query = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
         self.pos_embed = nn.Parameter(torch.randn(1, pose_length, hidden_dim) * 0.02)
 
         # ── Causal Transformer decoder layers ──
@@ -108,11 +105,10 @@ class Planner(nn.Module):
             music_path: optional path to MP3/WAV
             music_feats: optional pre-encoded music features [B, L, music_dim]
         """
-        B = perception['global'].shape[0]
-        device = perception['global'].device
-
-        z_global = self.z_proj(perception['global']).unsqueeze(1)
-        z_0 = self.z_proj(perception['features_0']).unsqueeze(1)
+        z_0_raw = perception['features_0']                      # [B, dim] causally-scoped frame_0
+        B = z_0_raw.shape[0]
+        device = z_0_raw.device
+        z_0 = self.z_proj(z_0_raw).unsqueeze(1)                  # [B, 1, hidden]
 
         # Text
         text_feats = self.encode_text(texts)
@@ -128,9 +124,9 @@ class Planner(nn.Module):
         else:
             music_mem = None
 
-        # Trajectory queries
+        # Trajectory queries — prepend causally-scoped frame_0 feature as context token
         queries = self.traj_queries.expand(B, -1, -1) + self.pos_embed
-        queries = torch.cat([self.z_query.expand(B, -1, -1), queries], dim=1)  # [B, 1+N, hidden]
+        queries = torch.cat([z_0, queries], dim=1)  # [B, 1+N, hidden]
 
         # Causal mask
         total_len = 1 + self.pose_length

@@ -1,10 +1,16 @@
 """
-Video Perception Encoder — extracts 3D-aware features from RGB frame sequences.
+Video Perception Encoder — extracts causal 3D-aware features from RGB frame sequences.
+
+Causal paradigm (closed-loop):
+  frame_0 → Planner initial trajectory
+  frame_t → Refiner gets z_real_t (only sees frames ≤ t) → corrects remaining path
 
 Architecture:
   1. Per-frame: frozen CLIP ViT-B/32 extracts 512-dim features
-  2. Temporal: lightweight transformer aggregates across frames
-  3. Output: per-frame latents [T, dim] with cross-frame 3D understanding
+  2. Temporal: lightweight transformer with CAUSAL mask — frame_i only
+     attends to frames [0..i], preventing future information leakage
+  3. Output: per-frame latents [T, dim] where each frame's feature is
+     causally scoped to its own timestamp and earlier
 
 No depth maps required. The model learns multi-view geometry implicitly
 from RGB frame sequences, similar to monocular 3D reconstruction methods.
@@ -44,7 +50,8 @@ class VideoPerceptionEncoder(nn.Module):
         )
 
         # ── Temporal aggregator ──
-        self.temporal_pos = nn.Parameter(torch.randn(1, 64, dim) * 0.02)
+        self.max_frames = 16               # generous upper bound, not 64
+        self.temporal_pos = nn.Parameter(torch.randn(1, self.max_frames, dim) * 0.02)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=dim, nhead=temporal_heads, dim_feedforward=dim * 4,
             dropout=0.1, batch_first=True, activation='gelu',
@@ -55,8 +62,10 @@ class VideoPerceptionEncoder(nn.Module):
     @torch.no_grad()
     def _clip_features(self, frames: torch.Tensor) -> torch.Tensor:
         """frames: [B*T, 3, H, W] → [B*T, 512]"""
-        if frames.shape[-1] != 224:
-            frames = F.interpolate(frames, (224, 224), mode='bilinear', align_corners=False)
+        size = self.image_size
+        if frames.shape[-1] != size:
+            frames = F.interpolate(frames, (size, size),
+                                   mode='bilinear', align_corners=False)
         return self.clip_model(frames)
 
     def forward(self, frames: torch.Tensor) -> dict:
@@ -66,9 +75,11 @@ class VideoPerceptionEncoder(nn.Module):
 
         Returns:
             dict with:
-              'features':   [B, T, dim] per-frame latents (temporal-contextualized)
+              'features':   [B, T, dim] per-frame latents, causally scoped
+                            (frame_i only attends to frames [0..i])
               'global':     [B, dim]    pooled global scene representation
-              'features_0': [B, dim]    first-frame feature (before temporal)
+              'features_0': [B, dim]    first-frame causally-encoded feature
+                            (only sees frame_0 itself, used for Planner init)
         """
         B, T = frames.shape[:2]
         device = frames.device
@@ -79,15 +90,20 @@ class VideoPerceptionEncoder(nn.Module):
         feats = self.frame_proj(clip_feats)      # [B*T, dim]
         feats = feats.reshape(B, T, self.dim)    # [B, T, dim]
 
-        # Save first-frame raw feature (used by Planner as initial perception)
-        features_0 = feats[:, 0, :]
-
         # Add temporal positional encoding
         feats = feats + self.temporal_pos[:, :T, :]
 
-        # Temporal aggregation
-        feats = self.temporal(feats)
+        # ── Causal temporal aggregation ──
+        # frame_i can only attend to frames [0..i]; future frames are masked.
+        # Boolean mask: True = keep, False = mask.  tril gives lower triangle.
+        causal_mask = torch.tril(
+            torch.ones(T, T, device=device, dtype=torch.bool),
+        )
+        feats = self.temporal(feats, mask=causal_mask)
         feats = self.temporal_norm(feats)  # [B, T, dim]
+
+        # First-frame causally-encoded feature (only sees frame_0)
+        features_0 = feats[:, 0, :]
 
         # Global scene embedding (mean pool over time)
         global_feat = feats.mean(dim=1)  # [B, dim]
@@ -97,10 +113,3 @@ class VideoPerceptionEncoder(nn.Module):
             'global': global_feat,
             'features_0': features_0,
         }
-
-    @torch.no_grad()
-    def encode_frame(self, image: torch.Tensor) -> torch.Tensor:
-        """Single-frame inference: image [3, H, W] → latent [dim]."""
-        if image.dim() == 3:
-            image = image.unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
-        return self.forward(image)['global'][0]

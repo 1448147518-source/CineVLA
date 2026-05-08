@@ -11,7 +11,7 @@ Usage:
   python eval.py default --image_path "video.mp4" --text "..." --resume "ckpt.safetensors"
 """
 
-import os, json, time, glob
+import os, json, glob
 import cv2, numpy as np
 import torch, tyro
 import torch.nn.functional as F
@@ -20,7 +20,7 @@ from core.options import AllConfigs
 from core.perception import VideoPerceptionEncoder
 from core.planner import Planner
 from core.refiner import Refiner
-from core.utils import slerp_trajectory
+from core.utils import slerp_trajectory, quat_to_rot
 from visualise.trajectory import plot_trajectory
 from visualise.latent import LatentLogger
 
@@ -30,14 +30,16 @@ class CineVLAInference:
         self.opt = opt
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        self.perception = VideoPerceptionEncoder(opt.perception_dim, opt.image_size)
+        self.perception = VideoPerceptionEncoder(opt.perception_dim, opt.image_size,
+                                                 freeze_backbone=opt.freeze_encoders)
         self.planner = Planner(pose_dim=opt.pose_dim, pose_length=opt.pose_length,
                                perception_dim=opt.perception_dim,
                                hidden_dim=opt.planner_hidden_dim,
                                num_layers=opt.planner_num_layers,
                                num_heads=opt.planner_num_heads,
                                music_ca_layers=opt.music_ca_layers,
-                               music_dim=opt.music_dim)
+                               music_dim=opt.music_dim,
+                               freeze_text_encoder=opt.freeze_encoders)
         self.refiner = Refiner(pose_dim=opt.pose_dim, perception_dim=opt.perception_dim,
                                hidden_dim=opt.refiner_hidden_dim,
                                num_layers=opt.refiner_num_layers,
@@ -70,7 +72,7 @@ class CineVLAInference:
         Ht = Wt = 224
 
         def _load_one(p):
-            img = cv2.imread(p, cv2.IMREAD_UNCHANGED).astype(np.float32) / 255.
+            img = cv2.imread(p, cv2.IMREAD_COLOR).astype(np.float32) / 255.
             img = img[..., [2, 1, 0]]
             t = torch.from_numpy(img).permute(2, 0, 1).float()
             h, w = t.shape[1], t.shape[2]
@@ -129,41 +131,31 @@ class CineVLAInference:
         )
 
     @torch.no_grad()
-    def run(self, image_path, text, music_path=None, output_dir='outputs'):
-        os.makedirs(output_dir, exist_ok=True)
+    def infer(self, image_path, text, music_path=None):
+        """Core inference: returns trajectory + perception + text features.
 
-        # ── Phase 1: Plan with CFG ──
+        No file I/O or visualization.  Benchmarks call this directly.
+        """
+        # Phase 1: Plan with CFG
         frames = self._load_frame_sequence(image_path, num_frames=self.opt.num_frames)
         perc = self.perception(frames)
         text_feats = self.planner.encode_text([text])
 
-        # Conditional trajectory (with text guidance)
         cond_plan = self.planner.plan(perc, [text], music_path=music_path)
-        # Unconditional trajectory (empty text)
         uncond_plan = self.planner.plan(perc, [''], music_path=music_path)
-        # CFG extrapolation
         cfg_scale = getattr(self.opt, 'cfg_scale', 2.0)
         plan = uncond_plan + cfg_scale * (cond_plan - uncond_plan)
-        print(f"[Planner] {plan.shape[0]} frames initial trajectory (CFG={cfg_scale})")
 
-        # ── Phase 2: Closed-loop refinement ──
+        # Phase 2: Closed-loop refinement
         trajectory = plan.clone()
-        z_pred = perc['features_0']  # initial prediction
+        z_pred = perc['features_0'].squeeze(0)
         N = min(self.opt.closed_loop_steps, plan.shape[0])
         steps = []
-
-        latent_logger = None
-        if getattr(self.opt, 'vis_latent', False):
-            latent_logger = LatentLogger(save_dir='pred_latent')
 
         for t in range(N - 1):
             T = frames.shape[1]
             fi = min(int(t / N * T), T - 1)
-            z_real = perc['features'][:, fi, :].squeeze(0)  # current frame feature
-
-            # Log latent state if visualization enabled
-            if latent_logger is not None:
-                latent_logger.log(z_real, z_pred, step=t, phase='infer')
+            z_real = perc['features'][:, fi, :].squeeze(0)
 
             error = F.mse_loss(z_real, z_pred).item()
             if error > 0.01 and t < N - 1:
@@ -172,15 +164,44 @@ class CineVLAInference:
                     refined, z_pred_next = self.refiner.refine(
                         z_real, z_pred, remaining, text_feats.squeeze(0))
                     trajectory[t + 1:] = refined
-                    z_pred = z_pred_next.unsqueeze(0)
-                    print(f"  Step {t}: refined {remaining.shape[0]} frames, err={error:.4f}")
+                    z_pred = z_pred_next
 
             steps.append({'step': t, 'pose': trajectory[t].tolist(), 'error': error})
+
+        return {
+            'trajectory': trajectory, 'steps': steps, 'perc': perc,
+            'text_feats': text_feats, 'cfg_scale': cfg_scale,
+        }
+
+    @torch.no_grad()
+    def run(self, image_path, text, music_path=None, output_dir='outputs'):
+        os.makedirs(output_dir, exist_ok=True)
+
+        result = self.infer(image_path, text, music_path=music_path)
+        trajectory = result['trajectory']
+        perc = result['perc']
+        text_feats = result['text_feats']
+        steps = result['steps']
+
+        print(f"[Planner] {trajectory.shape[0]} frames (CFG={result['cfg_scale']})")
+
+        # ── Latent visualization (optional) ──
+        latent_logger = None
+        if getattr(self.opt, 'vis_latent', False):
+            latent_logger = LatentLogger(save_dir=os.path.join(output_dir, 'pred_latent'))
+            N = min(self.opt.closed_loop_steps, trajectory.shape[0])
+            collected = set()
+            for t in range(N - 1):
+                fi = min(int(t / N * self.opt.num_frames), self.opt.num_frames - 1)
+                z_real = perc['features'][0, fi, :]
+                if fi not in collected:
+                    latent_logger.log(z_real, perc['features_0'][0], step=t, phase='infer')
+                    collected.add(fi)
 
         # ── Output ──
         poses_34 = torch.zeros(trajectory.shape[0], 3, 4)
         for i, p in enumerate(trajectory):
-            R = _q2r(p[:4])
+            R = quat_to_rot(p[:4])
             poses_34[i, :, :3] = R
             poses_34[i, :, 3] = p[4:7]
         dense = slerp_trajectory(poses_34, self.opt.dense_frames)
@@ -190,30 +211,25 @@ class CineVLAInference:
         json.dump(steps, open(os.path.join(output_dir, 'steps.json'), 'w'), indent=2)
         print(f"[Done] → {output_dir}/")
 
+        # Expose intermediate features for benchmark reuse
+        self._last_perc = perc
+        self._last_text_feats = text_feats
+
         # ── Trajectory visualization (always) ──
         plot_trajectory(
             trajectory.cpu().numpy(),
             dense=dense.cpu().numpy(),
             steps=steps,
-            save_dir='results',
+            save_dir=os.path.join(output_dir, 'results'),
             title=f'CineVLA — {text[:60]}'
         )
 
         # ── Latent visualization finalize ──
         if latent_logger is not None:
             latent_logger.finalize()
-            print(f"[visualise] Latent state plots saved to pred_latent/")
+            print(f"[visualise] Latent plots → {output_dir}/pred_latent/")
 
         return {'trajectory': trajectory, 'dense': dense}
-
-
-def _q2r(q):
-    w, x, y, z = q
-    return torch.tensor([
-        [1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
-        [2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)],
-        [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)],
-    ])
 
 
 def main():

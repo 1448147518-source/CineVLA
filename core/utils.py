@@ -1,8 +1,17 @@
 """Camera math: quaternion ↔ matrix, SLERP, and token conversion."""
 
-import math
 import torch
 import numpy as np
+
+
+def quat_to_rot(q):
+    """Single quaternion (w, x, y, z) → 3×3 rotation matrix."""
+    w, x, y, z = q[0], q[1], q[2], q[3]
+    return torch.tensor([
+        [1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+        [2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+        [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)],
+    ], dtype=q.dtype, device=q.device)
 
 
 def quaternion_to_matrix(quaternions):
@@ -54,6 +63,7 @@ def quaternion_slerp(q0, q1, fraction, shortestpath=True):
     d = (q0 * q1).sum(-1)
     if shortestpath:
         d[d < 0] = -d[d < 0]
+        q1 = q1.clone()
         q1[d < 0] = -q1[d < 0]
     d = d.clamp(0, 1.0)
     angle = torch.acos(d)

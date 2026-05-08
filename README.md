@@ -8,16 +8,18 @@ CineVLA 是一个闭环视觉-语言-动作系统。模型在每一步运动后�
 ## 架构
 
 ```
-Phase 1: 初始规划
-  RGB 帧序列 + 文本 [+ 音乐] → Video Perception → Planner → 初始轨迹
+Phase 1: 初始规划（因果）
+  frame_0（仅第一帧） + 文本 [+ 音乐] → Video Perception(causal) → Planner → 初始轨迹
 
-Phase 2: 闭环执行
-  camera 走到 p_t → 捕捉当前帧
-  Perception(当前帧) → z_t（真实环境感知）
-  z_t vs 预测的 ẑ_t → 感知误差
-  Refiner → 修正剩余轨迹 + 预测下一帧状态
+Phase 2: 闭环执行（因果）
+  camera 走到 p_t → 捕捉当前帧 img_t
+  Perception(img_0...img_t, causal) → z_t（仅感知 ≤t 帧，无未来信息泄露）
+  z_t vs 上一步预测的 ẑ_t → 感知误差
+  Refiner → 修正剩余轨迹 + 预测下一帧状态 ẑ_{t+1}
   camera 走到修正后的 p_{t+1}
 ```
+
+时序 Transformer 采用**因果掩码**：frame_i 的自注意力仅允许看到 frame_0...frame_i，无法注意到后续帧。这保证了闭环修正中每一步的感知严格依赖于已观测帧。
 
 音乐可选，仅在 Planner 顶层交叉注意力中注入节奏特征，使轨迹跟随节拍律动。
 

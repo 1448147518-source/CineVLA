@@ -18,41 +18,20 @@ import torch
 # ── NumPy-only PCA (avoids sklearn dependency) ──
 
 class _SimplePCA:
-    """PCA via SVD.  Supports incremental partial-fit via running mean/cov."""
+    """PCA via SVD.  Fit on a data matrix, then transform."""
 
     def __init__(self, n_components=2):
         self.n_components = n_components
         self.mean_ = None
         self.components_ = None
-        self._n_samples = 0
-
-    def partial_fit(self, X):
-        """Update running mean.  Components are re-computed on finalize."""
-        X = np.asarray(X, dtype=np.float32)
-        if self.mean_ is None:
-            self.mean_ = X.sum(axis=0)
-            self._n_samples = X.shape[0]
-        else:
-            self.mean_ += X.sum(axis=0)
-            self._n_samples += X.shape[0]
-        return self
 
     def fit(self, X):
-        """Fit PCA from a (possibly subsampled) data matrix."""
         X = np.asarray(X, dtype=np.float32)
         self.mean_ = X.mean(axis=0)
         Xc = X - self.mean_
-        # SVD on centered data: U S Vt
         _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
         self.components_ = Vt[:self.n_components].copy()
         return self
-
-    def finalize_fit(self):
-        """Called after all partial_fit calls — recompute mean then fit."""
-        if self._n_samples == 0 or self.mean_ is None:
-            return self
-        self.mean_ /= self._n_samples
-        return self  # components are set when fit() is called later
 
     def transform(self, X):
         X = np.asarray(X, dtype=np.float32)
@@ -257,11 +236,15 @@ class LatentLogger:
 # ── Helpers ──
 
 def _to_numpy1d(x):
-    """Convert tensor/array to flat 1-D numpy float32."""
+    """Convert tensor/array to 1-D numpy float32.
+
+    Batched tensors [B, D] are mean-pooled over B to preserve
+    a representative feature vector rather than silently discarding
+    all but the first sample.
+    """
     if isinstance(x, torch.Tensor):
         x = x.detach().cpu().numpy()
     x = np.asarray(x, dtype=np.float32)
-    # take first batch element if batched
     while x.ndim > 1:
-        x = x[0]
+        x = x.mean(axis=0)
     return x

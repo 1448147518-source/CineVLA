@@ -19,7 +19,6 @@ class Options:
     planner_hidden_dim: int = 256
     planner_num_layers: int = 6
     planner_num_heads: int = 4
-    planner_text_ca_layers: int = 3    # text cross-attention in last N layers
 
     # ── Refiner ──
     refiner_hidden_dim: int = 256
@@ -35,7 +34,6 @@ class Options:
     # ── Training ──
     batch_size: int = 4
     lr: float = 1e-4
-    num_epochs: int = 100
     planner_pretrain_epochs: int = 30
     refiner_pretrain_epochs: int = 20
     joint_epochs: int = 50
@@ -43,7 +41,6 @@ class Options:
     grad_clip: float = 1.0
     warmup_ratio: float = 0.05
     mixed_precision: str = 'bf16'
-    seed: int = 42
     freeze_encoders: bool = True
 
     # ── Paths ──
@@ -51,13 +48,13 @@ class Options:
     exp_name: str = 'default'
     resume: Optional[str] = None
     data_path: str = 'DataDoP/train'
+    test_size: int = 1               # number of test samples
     image_path: Optional[str] = None
     text: Optional[str] = None
     music_path: Optional[str] = None
 
     # ── Inference (closed-loop + CFG) ──
     closed_loop_steps: int = 30        # max closed-loop steps
-    refinement_interval: int = 1       # refine every N steps
     cfg_scale: float = 2.0            # classifier-free guidance scale for text
 
     # ── Visualization ──

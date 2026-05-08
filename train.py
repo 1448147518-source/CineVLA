@@ -23,16 +23,23 @@ from visualise.latent import LatentLogger
 
 class _SimpleAccelerator:
     def __init__(self, grad_accum=1):
-        self.gradient_accumulation_steps = grad_accum; self._step = 0
+        self.gradient_accumulation_steps = grad_accum
+        self._step = 0
+        self._sync_gradients = False
+
     @property
     def is_main_process(self): return True
     def wait_for_everyone(self): pass
     def prepare(self, *args): return args
-    def backward(self, loss): loss.backward()
+    def backward(self, loss):
+        loss.backward()
+        self._step += 1
+        self._sync_gradients = (self._step % self.gradient_accumulation_steps == 0)
+
     @property
     def sync_gradients(self):
-        self._step += 1
-        return self._step % self.gradient_accumulation_steps == 0
+        return self._sync_gradients
+
     def clip_grad_norm_(self, p, m): torch.nn.utils.clip_grad_norm_(p, m)
     @contextlib.contextmanager
     def accumulate(self, model): yield
@@ -51,7 +58,8 @@ class CineVLA(nn.Module):
     def __init__(self, opt: Options):
         super().__init__()
         self.opt = opt
-        self.perception = VideoPerceptionEncoder(opt.perception_dim, opt.image_size)
+        self.perception = VideoPerceptionEncoder(opt.perception_dim, opt.image_size,
+                                                 freeze_backbone=opt.freeze_encoders)
         self.planner = Planner(
             pose_dim=opt.pose_dim, pose_length=opt.pose_length,
             perception_dim=opt.perception_dim,
@@ -60,6 +68,7 @@ class CineVLA(nn.Module):
             num_heads=opt.planner_num_heads,
             music_ca_layers=opt.music_ca_layers,
             music_dim=opt.music_dim,
+            freeze_text_encoder=opt.freeze_encoders,
         )
         self.refiner = Refiner(
             pose_dim=opt.pose_dim, perception_dim=opt.perception_dim,
@@ -72,9 +81,9 @@ class CineVLA(nn.Module):
         frames, texts, gt_poses = batch['frames'], batch['text'], batch['poses']
         music = batch.get('music_path')
 
-        # CFG: 10% text dropout during training
-        if self.training and random.random() < 0.1:
-            texts = [''] * len(texts)
+        # CFG: 10% per-sample text dropout during training
+        if self.training:
+            texts = ['' if random.random() < 0.1 else t for t in texts]
 
         perc = self.perception(frames)
         out = self.planner(perc, texts, music_path=music if isinstance(music, str) else None)
@@ -88,6 +97,7 @@ class CineVLA(nn.Module):
         texts = batch['text']
         music = batch.get('music_path')
         N = self.opt.pose_length
+        T = frames.shape[1]
 
         perc = self.perception(frames)
         text_feats = self.planner.encode_text(texts)
@@ -96,13 +106,26 @@ class CineVLA(nn.Module):
         t = torch.randint(1, N - 1, (1,)).item()
         max_k = min(self.opt.refiner_lookahead, N - 1 - t)
         K = torch.randint(1, max_k + 1, (1,)).item()
-        T = frames.shape[1]
         frame_idx = min(int(t / N * T), T - 1)
 
+        # Planner output serves as the noisy input the Refiner must correct
+        pred_poses = self.planner(perc, texts, music_path=music if isinstance(music, str) else None)['poses']
+
         z_real = perc['features'][:, frame_idx, :]
-        z_pred = perc['global']
-        remaining = gt_poses[:, t:t + K, :]
-        out = self.refiner(z_real, z_pred, remaining, text_feats)
+        # z_pred: feature from an earlier frame, simulating step-by-step prior knowledge
+        prev_idx = max(0, frame_idx - torch.randint(1, min(4, frame_idx + 1), (1,)).item())
+        z_pred = perc['features'][:, prev_idx, :]
+
+        # Refiner input = planner output (noisy), target = ground truth
+        remaining = pred_poses[:, t:t + K, :].detach()
+        gt_slice = gt_poses[:, t:t + K, :]
+
+        # z_next target = feature of the NEXT frame (true future prediction)
+        next_idx = min(frame_idx + 1, T - 1)
+        z_next_target = perc['features'][:, next_idx, :]
+
+        out = self.refiner(z_real, z_pred, remaining, text_feats,
+                           gt_poses=gt_slice, z_next_target=z_next_target)
         out['z_real'] = z_real  # for latent visualization
         out['z_pred'] = z_pred
         return out
@@ -163,8 +186,9 @@ def main():
     # ── Latent state visualization (optional) ──
     latent_logger = None
     if opt.vis_latent:
-        latent_logger = LatentLogger(save_dir='pred_latent')
-        logger.info("[visualise] Latent state logging enabled → pred_latent/")
+        latent_logger = LatentLogger(
+            save_dir=os.path.join(opt.workspace, opt.exp_name, 'pred_latent'))
+        logger.info("[visualise] Latent state logging enabled")
 
     def run_stage(name, epochs, keys=('loss',)):
         nonlocal gs, best
@@ -222,7 +246,7 @@ def main():
 
     if latent_logger is not None:
         latent_logger.finalize()
-        logger.info("[visualise] Latent state summaries saved to pred_latent/")
+        logger.info("[visualise] Latent state summaries saved")
 
     if wandb: wandb.finish()
 

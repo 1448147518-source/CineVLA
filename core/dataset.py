@@ -125,90 +125,103 @@ class CineVLADataset(Dataset):
 
     def __getitem__(self, idx):
         base = self.items[idx]
-        try:
-            j = json.load(open(base + '_transforms_cleaning.json'))
-            frames_json = j['frames']
-            H, W = j['h'], j['w']
-            fx, fy = j['fl_x'], j['fy']
-            cx, cy = j['cx'], j['cy']
-            N = self.pose_length
-            indices = np.arange(len(frames_json))[:120:120 // N][:N]
+        for _ in range(10):  # bounded retries to prevent infinite recursion
+            try:
+                j = json.load(open(base + '_transforms_cleaning.json'))
+                frames_json = j['frames']
+                H, W = j['h'], j['w']
+                fx, fy = j['fl_x'], j['fy']
+                cx, cy = j['cx'], j['cy']
+                N = self.pose_length
+                total = len(frames_json)
+                limit = min(120, total)
+                step = max(1, limit // N) if N <= limit else 1
+                indices = np.arange(total)[:limit:step][:N]
 
-            c2ws, poses_7d = [], []
-            for i in indices:
-                m = np.array(frames_json[i]['transform_matrix'])
-                c2ws.append(m)
-                R = torch.from_numpy(m[:3, :3])
-                T = torch.from_numpy(m[:3, 3])
-                q = matrix_to_quaternion(R.unsqueeze(0)).squeeze(0)
-                poses_7d.append(torch.cat([q, T]))
+                c2ws, poses_7d = [], []
+                for i in indices:
+                    m = np.array(frames_json[i]['transform_matrix'])
+                    c2ws.append(m)
+                    R = torch.from_numpy(m[:3, :3])
+                    T = torch.from_numpy(m[:3, 3])
+                    q = matrix_to_quaternion(R.unsqueeze(0)).squeeze(0)
+                    poses_7d.append(torch.cat([q, T]))
 
-            poses_7d = torch.stack(poses_7d)
-            c2ws_np = np.stack(c2ws)
+                poses_7d = torch.stack(poses_7d)
+                c2ws_np = np.stack(c2ws)
 
-            # Normalize to first frame's coordinate frame
-            ref = np.linalg.inv(c2ws_np[0])
-            for i in range(N):
-                c2ws_np[i] = ref @ c2ws_np[i]
-            Tn = np.linalg.norm(c2ws_np[:, :3, 3], axis=-1).max() + 1e-5
-            c2ws_np[:, :3, 3] /= Tn
-            poses_7d[:, 4:7] /= Tn
+                # Normalize to first frame's coordinate frame
+                ref = np.linalg.inv(c2ws_np[0])
+                for i in range(N):
+                    c2ws_np[i] = ref @ c2ws_np[i]
+                Tn = np.linalg.norm(c2ws_np[:, :3, 3], axis=-1).max() + 1e-5
+                c2ws_np[:, :3, 3] /= Tn
+                poses_7d[:, 4:7] /= Tn
 
-            # ── Frame sequence (video > _frames/ — mandatory) ──
-            video_path = base + '_video.mp4'
-            frames_dir = base + '_frames'
+                # ── Frame sequence (video > _frames/ — mandatory) ──
+                video_path = base + '_video.mp4'
+                frames_dir = base + '_frames'
 
-            if os.path.exists(video_path):
-                frames = self._extract_video_frames(video_path)
-                if frames is None:
+                if os.path.exists(video_path):
+                    frames = self._extract_video_frames(video_path)
+                    if frames is None:
+                        raise RuntimeError(
+                            f"Video {video_path} has fewer than "
+                            f"{self.num_frames} usable frames"
+                        )
+                elif os.path.isdir(frames_dir):
+                    frame_files = sorted(
+                        glob.glob(os.path.join(frames_dir, '*.png'))
+                        + glob.glob(os.path.join(frames_dir, '*.jpg')),
+                        key=lambda p: (
+                            int(os.path.splitext(os.path.basename(p))[0])
+                            if os.path.splitext(os.path.basename(p))[0].isdigit()
+                            else 0
+                        ))
+                    if len(frame_files) < self.num_frames:
+                        raise RuntimeError(
+                            f"{frames_dir}: {len(frame_files)} PNG frames "
+                            f"found, need >= {self.num_frames}"
+                        )
+                    frames = torch.stack(
+                        [self._load_rgb(f)
+                         for f in frame_files[:self.num_frames]])
+                else:
                     raise RuntimeError(
-                        f"Video {video_path} has fewer than {self.num_frames} "
-                        f"usable frames"
+                        f"Sample {base} must have _video.mp4 or "
+                        f"_frames/ directory"
                     )
-            elif os.path.isdir(frames_dir):
-                frame_files = sorted(
-                    glob.glob(os.path.join(frames_dir, '*.png')))
-                if len(frame_files) < self.num_frames:
-                    raise RuntimeError(
-                        f"{frames_dir}: {len(frame_files)} PNG frames found, "
-                        f"need >= {self.num_frames}"
-                    )
-                frames = torch.stack(
-                    [self._load_rgb(f) for f in frame_files[:self.num_frames]])
-            else:
-                raise RuntimeError(
-                    f"Sample {base} must have _video.mp4 or _frames/ directory"
-                )
 
-            text = self.captions.get(base, '')
-            music = base + '_music.mp3' if os.path.exists(base + '_music.mp3') else None
+                text = self.captions.get(base, '')
+                music = (base + '_music.mp3'
+                         if os.path.exists(base + '_music.mp3') else None)
 
-            return {
-                'frames': frames,
-                'poses': poses_7d.float(),
-                'c2ws': torch.from_numpy(c2ws_np).float(),
-                'intrinsics': torch.tensor([fx, fy, cx, cy]).float(),
-                'text': text,
-                'music_path': music,
-                'path': base,
-            }
-        except RuntimeError:
-            raise
-        except Exception as e:
-            print(f"Error {base}: {e}")
-            return self.__getitem__(np.random.randint(0, len(self.items)))
+                return {
+                    'frames': frames,
+                    'poses': poses_7d.float(),
+                    'text': text,
+                    'music_path': music,
+                    'path': base,
+                }
+            except RuntimeError:
+                raise
+            except Exception as e:
+                print(f"Error {base}: {e}")
+                base = self.items[np.random.randint(0, len(self.items))]
+                continue
+
+        raise RuntimeError(
+            f"Failed to load sample after 10 retries (last: {base})"
+        )
 
 
 def collate_fn(batch):
     T = batch[0]['frames'].shape[0]
     frames = torch.stack([b['frames'][:T] for b in batch])
     poses = torch.stack([b['poses'] for b in batch])
-    c2ws = torch.stack([b['c2ws'] for b in batch])
-    intr = torch.stack([b['intrinsics'] for b in batch])
     music = [b['music_path'] for b in batch]
     return {
-        'frames': frames, 'poses': poses, 'c2ws': c2ws,
-        'intrinsics': intr,
+        'frames': frames, 'poses': poses,
         'text': [b['text'] for b in batch],
         'music_path': music[0] if all(m == music[0] for m in music) else music,
         'paths': [b['path'] for b in batch],
