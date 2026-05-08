@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from scipy import linalg
 from scipy.stats import mode
+from itertools import product
 
 
 # ── Helper: multivariate Gaussian stats ──

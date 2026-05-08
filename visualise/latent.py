@@ -18,7 +18,7 @@ import torch
 # ── NumPy-only PCA (avoids sklearn dependency) ──
 
 class _SimplePCA:
-    """PCA via SVD.  Fit on a data matrix, then transform."""
+    """PCA via SVD."""
 
     def __init__(self, n_components=2):
         self.n_components = n_components
@@ -26,9 +26,11 @@ class _SimplePCA:
         self.components_ = None
 
     def fit(self, X):
+        """Fit PCA from a (possibly subsampled) data matrix."""
         X = np.asarray(X, dtype=np.float32)
         self.mean_ = X.mean(axis=0)
         Xc = X - self.mean_
+        # SVD on centered data: U S Vt
         _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
         self.components_ = Vt[:self.n_components].copy()
         return self
@@ -236,15 +238,11 @@ class LatentLogger:
 # ── Helpers ──
 
 def _to_numpy1d(x):
-    """Convert tensor/array to 1-D numpy float32.
-
-    Batched tensors [B, D] are mean-pooled over B to preserve
-    a representative feature vector rather than silently discarding
-    all but the first sample.
-    """
+    """Convert tensor/array to flat 1-D numpy float32."""
     if isinstance(x, torch.Tensor):
         x = x.detach().cpu().numpy()
     x = np.asarray(x, dtype=np.float32)
+    # take first batch element if batched
     while x.ndim > 1:
-        x = x.mean(axis=0)
+        x = x[0]
     return x

@@ -5,7 +5,7 @@ Usage:
   python train.py default --workspace workspace --exp_name run1
 """
 
-import os, math, sys, contextlib, random
+import os, math, contextlib, random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,6 +18,7 @@ from core.planner import Planner
 from core.refiner import Refiner
 from core.dataset import CineVLADataset, collate_fn
 from core.utils import init_logger
+from core.losses import planner_loss, refiner_loss, get_effective_pose_length
 from visualise.latent import LatentLogger
 
 
@@ -25,22 +26,21 @@ class _SimpleAccelerator:
     def __init__(self, grad_accum=1):
         self.gradient_accumulation_steps = grad_accum
         self._step = 0
-        self._sync_gradients = False
-
+        self._should_step = True
     @property
     def is_main_process(self): return True
     def wait_for_everyone(self): pass
     def prepare(self, *args): return args
     def backward(self, loss):
-        loss.backward()
-        self._step += 1
-        self._sync_gradients = (self._step % self.gradient_accumulation_steps == 0)
-
+        (loss / self.gradient_accumulation_steps).backward()
     @property
     def sync_gradients(self):
-        return self._sync_gradients
-
-    def clip_grad_norm_(self, p, m): torch.nn.utils.clip_grad_norm_(p, m)
+        self._step += 1
+        self._should_step = self._step % self.gradient_accumulation_steps == 0
+        return self._should_step
+    def clip_grad_norm_(self, p, m):
+        if self._should_step:
+            torch.nn.utils.clip_grad_norm_(p, m)
     @contextlib.contextmanager
     def accumulate(self, model): yield
 
@@ -58,8 +58,7 @@ class CineVLA(nn.Module):
     def __init__(self, opt: Options):
         super().__init__()
         self.opt = opt
-        self.perception = VideoPerceptionEncoder(opt.perception_dim, opt.image_size,
-                                                 freeze_backbone=opt.freeze_encoders)
+        self.perception = VideoPerceptionEncoder(opt.perception_dim, opt.image_size)
         self.planner = Planner(
             pose_dim=opt.pose_dim, pose_length=opt.pose_length,
             perception_dim=opt.perception_dim,
@@ -68,7 +67,6 @@ class CineVLA(nn.Module):
             num_heads=opt.planner_num_heads,
             music_ca_layers=opt.music_ca_layers,
             music_dim=opt.music_dim,
-            freeze_text_encoder=opt.freeze_encoders,
         )
         self.refiner = Refiner(
             pose_dim=opt.pose_dim, perception_dim=opt.perception_dim,
@@ -81,23 +79,32 @@ class CineVLA(nn.Module):
         frames, texts, gt_poses = batch['frames'], batch['text'], batch['poses']
         music = batch.get('music_path')
 
-        # CFG: 10% per-sample text dropout during training
-        if self.training:
-            texts = ['' if random.random() < 0.1 else t for t in texts]
+        # CFG: 10% text dropout during training
+        if self.training and random.random() < 0.1:
+            texts = [''] * len(texts)
 
         perc = self.perception(frames)
         out = self.planner(perc, texts, music_path=music if isinstance(music, str) else None)
-        loss = F.mse_loss(out['poses'], gt_poses)
-        return {'loss': loss, 'pred_poses': out['poses']}
+
+        # v4: decoupled geometric loss
+        eff_N = getattr(self, 'effective_pose_length', None)
+        loss, comps = planner_loss(
+            out['poses'], gt_poses, effective_N=eff_N,
+            lambda_rot=self.opt.lambda_rot,
+            lambda_trans=self.opt.lambda_trans,
+            lambda_rel=self.opt.lambda_rel,
+            lambda_smooth=self.opt.lambda_smooth,
+            window_size=self.opt.rel_window_size,
+            lambda_rot_smooth=self.opt.lambda_rot_smooth,
+            lambda_rel_t=self.opt.lambda_rel_t,
+        )
+        return {'loss': loss, 'pred_poses': out['poses'], **comps}
 
     def forward_refiner(self, batch):
-        B = len(batch['text'])
         frames = batch['frames']
         gt_poses = batch['poses']
         texts = batch['text']
-        music = batch.get('music_path')
         N = self.opt.pose_length
-        T = frames.shape[1]
 
         perc = self.perception(frames)
         text_feats = self.planner.encode_text(texts)
@@ -106,37 +113,43 @@ class CineVLA(nn.Module):
         t = torch.randint(1, N - 1, (1,)).item()
         max_k = min(self.opt.refiner_lookahead, N - 1 - t)
         K = torch.randint(1, max_k + 1, (1,)).item()
+        T = frames.shape[1]
         frame_idx = min(int(t / N * T), T - 1)
 
-        # Planner output serves as the noisy input the Refiner must correct
-        pred_poses = self.planner(perc, texts, music_path=music if isinstance(music, str) else None)['poses']
-
         z_real = perc['features'][:, frame_idx, :]
-        # z_pred: feature from an earlier frame, simulating step-by-step prior knowledge
-        prev_idx = max(0, frame_idx - torch.randint(1, min(4, frame_idx + 1), (1,)).item())
-        z_pred = perc['features'][:, prev_idx, :]
+        z_pred = perc['global']
+        remaining = gt_poses[:, t:t + K, :]
+        raw = self.refiner(z_real, z_pred, remaining, text_feats)
 
-        # Refiner input = planner output (noisy), target = ground truth
-        remaining = pred_poses[:, t:t + K, :].detach()
-        gt_slice = gt_poses[:, t:t + K, :]
-
-        # z_next target = feature of the NEXT frame (true future prediction)
-        next_idx = min(frame_idx + 1, T - 1)
-        z_next_target = perc['features'][:, next_idx, :]
-
-        out = self.refiner(z_real, z_pred, remaining, text_feats,
-                           gt_poses=gt_slice, z_next_target=z_next_target)
-        out['z_real'] = z_real  # for latent visualization
-        out['z_pred'] = z_pred
-        return out
+        # v4: geometric refiner loss
+        loss, comps = refiner_loss(
+            raw['refined'], remaining, raw['z_next_pred'], z_real,
+            lambda_pose=self.opt.lambda_pose_delta,
+            lambda_z=self.opt.lambda_z_pred,
+            lambda_rel=self.opt.lambda_rel_ref,
+            lambda_smooth=self.opt.lambda_smooth_ref,
+            window_size=self.opt.rel_window_size,
+            lambda_rot_smooth=self.opt.lambda_rot_smooth,
+            lambda_rel_t=self.opt.lambda_rel_t,
+        )
+        return {'loss': loss, 'z_real': z_real, 'z_pred': z_pred, **comps}
 
     def forward(self, batch, stage='joint'):
         if stage == 'planner': return self.forward_planner(batch)
         if stage == 'refiner': return self.forward_refiner(batch)
         p = self.forward_planner(batch)
         r = self.forward_refiner(batch)
-        return {'loss': p['loss'] + r['loss'], 'loss_p': p['loss'], 'loss_r': r['loss'],
-                'z_real': r.get('z_real'), 'z_pred': r.get('z_pred')}
+        result = {'loss': p['loss'] + r['loss'],
+                  'loss_p': p['loss'], 'loss_r': r['loss'],
+                  'z_real': r.get('z_real'), 'z_pred': r.get('z_pred')}
+        # Merge component losses with prefix for logging clarity
+        for k, v in p.items():
+            if k.startswith('L_'):
+                result[f'p_{k}'] = v
+        for k, v in r.items():
+            if k.startswith('loss_'):
+                result[f'r_{k}'] = v
+        return result
 
 
 def main():
@@ -186,24 +199,31 @@ def main():
     # ── Latent state visualization (optional) ──
     latent_logger = None
     if opt.vis_latent:
-        latent_logger = LatentLogger(
-            save_dir=os.path.join(opt.workspace, opt.exp_name, 'pred_latent'))
-        logger.info("[visualise] Latent state logging enabled")
+        latent_logger = LatentLogger(save_dir='pred_latent')
+        logger.info("[visualise] Latent state logging enabled → pred_latent/")
 
     def run_stage(name, epochs, keys=('loss',)):
         nonlocal gs, best
         for ep in range(epochs):
+            # Progressive trajectory-length curriculum (planner stage only)
+            if name == 'planner':
+                model.effective_pose_length = get_effective_pose_length(
+                    ep, epochs,
+                    start_len=opt.pose_start_len,
+                    full_len=opt.pose_length,
+                    ramp_epochs=opt.curriculum_ramp_epochs,
+                )
             model.train()
             tl, sl, seen = 0.0, {k: 0.0 for k in keys}, 0
             for batch in dl:
                 with acc.accumulate(model):
-                    optm.zero_grad()
                     out = model(batch, stage=name)
                     loss = out['loss']
                     acc.backward(loss)
                     if acc.sync_gradients:
                         acc.clip_grad_norm_(model.parameters(), opt.grad_clip)
-                    optm.step(); sch.step()
+                        optm.step(); sch.step()
+                        optm.zero_grad()
 
                 lv = loss.detach().item() if has_acc else loss.item()
                 tl += lv
@@ -222,23 +242,35 @@ def main():
                     lr = sch.get_last_lr()[0]
                     logger.info(f"[{name}] ep{ep} step{gs} loss={lv:.4f} lr={lr:.2e}")
                     if wandb:
-                        wandb.log({'train/loss': lv, 'train/lr': lr,
-                                   'train/epoch': ep, 'train/stage': name, 'train/step': gs})
+                        log_dict = {'train/loss': lv, 'train/lr': lr,
+                                    'train/epoch': ep, 'train/stage': name, 'train/step': gs}
+                        for k in keys:
+                            if k in out:
+                                log_dict[f'train/{k}'] = (out[k].detach().item() if has_acc else out[k].item())
+                        wandb.log(log_dict)
                 gs += 1
 
             avg = tl / seen
-            logger.info(f"[{name}] ep{ep} avg={avg:.4f} " +
-                        ' '.join(f'{k}={sl[k]/seen:.4f}' for k in keys))
+            msg = f"[{name}] ep{ep} avg={avg:.4f} " + ' '.join(f'{k}={sl[k]/seen:.4f}' for k in keys)
+            if name == 'planner':
+                msg += f' N_eff={model.effective_pose_length}'
+            logger.info(msg)
             if wandb:
-                wandb.log({'train/avg_loss': avg, 'train/stage_epoch': ep,
-                          **{f'train/{k}': sl[k]/seen for k in keys}})
+                log_dict = {'train/avg_loss': avg, 'train/stage_epoch': ep,
+                          **{f'train/{k}': sl[k]/seen for k in keys}}
+                if name == 'planner':
+                    log_dict['train/effective_pose_length'] = model.effective_pose_length
+                wandb.log(log_dict)
             if avg < best:
                 best = avg; acc.wait_for_everyone()
                 save_file(model.state_dict(), os.path.join(opt.workspace, opt.exp_name, 'best.safetensors'))
 
-    run_stage('planner', opt.planner_pretrain_epochs)
-    run_stage('refiner', opt.refiner_pretrain_epochs, keys=('loss', 'loss_pose', 'loss_z'))
-    run_stage('joint', opt.joint_epochs, keys=('loss', 'loss_p', 'loss_r'))
+    run_stage('planner', opt.planner_pretrain_epochs,
+              keys=('loss', 'L_rot', 'L_trans', 'L_rel', 'L_smooth'))
+    run_stage('refiner', opt.refiner_pretrain_epochs,
+              keys=('loss', 'loss_pose', 'loss_z', 'loss_rel', 'loss_smooth'))
+    run_stage('joint', opt.joint_epochs,
+              keys=('loss', 'loss_p', 'loss_r'))
 
     acc.wait_for_everyone()
     save_file(model.state_dict(), os.path.join(opt.workspace, opt.exp_name, 'model.safetensors'))
@@ -246,7 +278,7 @@ def main():
 
     if latent_logger is not None:
         latent_logger.finalize()
-        logger.info("[visualise] Latent state summaries saved")
+        logger.info("[visualise] Latent state summaries saved to pred_latent/")
 
     if wandb: wandb.finish()
 

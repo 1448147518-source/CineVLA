@@ -1,5 +1,5 @@
 import tyro
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Dict
 
 
@@ -19,6 +19,7 @@ class Options:
     planner_hidden_dim: int = 256
     planner_num_layers: int = 6
     planner_num_heads: int = 4
+    planner_text_ca_layers: int = 3    # text cross-attention in last N layers
 
     # ── Refiner ──
     refiner_hidden_dim: int = 256
@@ -41,14 +42,12 @@ class Options:
     grad_clip: float = 1.0
     warmup_ratio: float = 0.05
     mixed_precision: str = 'bf16'
-    freeze_encoders: bool = True
 
     # ── Paths ──
     workspace: str = 'workspace'
     exp_name: str = 'default'
     resume: Optional[str] = None
     data_path: str = 'DataDoP/train'
-    test_size: int = 1               # number of test samples
     image_path: Optional[str] = None
     text: Optional[str] = None
     music_path: Optional[str] = None
@@ -60,6 +59,24 @@ class Options:
     # ── Visualization ──
     vis_latent: bool = False           # enable latent state PCA visualization
     vis_latent_every: int = 100        # log latent state every N training steps
+
+    # ── Loss weights (v4: decoupled geometric losses) ──
+    # Planner
+    lambda_rot: float = 1.0            # geodesic rotation loss weight
+    lambda_trans: float = 0.5          # L1 translation loss weight
+    lambda_rel: float = 0.05           # relative-pose consistency weight
+    lambda_smooth: float = 0.1         # trajectory smoothness weight
+    rel_window_size: int = 5           # causal window for relative-pose loss
+    lambda_rot_smooth: float = 0.5     # rotation weight inside smoothness term
+    lambda_rel_t: float = 0.1          # translation weight inside relative term
+    # Refiner
+    lambda_pose_delta: float = 1.0     # L1 delta regularisation
+    lambda_z_pred: float = 0.1         # feature prediction
+    lambda_rel_ref: float = 0.02       # relative consistency (refiner)
+    lambda_smooth_ref: float = 0.05    # smoothness (refiner)
+    # Curriculum
+    pose_start_len: int = 10           # initial trajectory length
+    curriculum_ramp_epochs: Optional[int] = None  # ramp duration (None → 67% of stage epochs)
 
 
 config_defaults: Dict[str, Options] = {}

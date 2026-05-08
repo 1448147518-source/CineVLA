@@ -1,40 +1,58 @@
 """
-CineVLA benchmark evaluation — FCD, PRDC, CLaTr Score, caption metrics.
+CineVLA benchmark evaluation — computes FCD, PRDC, CLaTr Score on a test split.
 
 Usage:
   python -m evaluate.eval_benchmark --resume ckpt.safetensors --data_path DataDoP/train
 
-Reuses CineVLAInference for trajectory generation — no duplicated inference logic.
+Flow:
+  1. Load CineVLA model from checkpoint
+  2. Load test split via CineVLADataset(test=True)
+  3. For each sample: generate trajectory → encode to feature
+  4. For each sample: encode GT trajectory → reference feature
+  5. For each sample: encode text → text feature
+  6. Aggregate across all samples → compute metrics → save CSV
 """
 
-import os, sys
+import os, sys, json
 import numpy as np
-import pandas as pd
 import torch
 import tyro
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.options import Options
-from core.dataset import CineVLADataset
+from core.dataset import CineVLADataset, collate_fn
+from core.perception import VideoPerceptionEncoder
+from core.planner import Planner
+from core.refiner import Refiner
 from core.metrics import MetricsAccumulator
-from core.utils import quaternion_to_matrix
 from evaluate.trajectory_encoder import TrajectoryEncoder
-from eval import CineVLAInference
 
 
 @dataclass
 class BenchmarkOptions(Options):
+    """Extended options for benchmark evaluation."""
     output_csv: str = 'metrics/benchmark.csv'
     prdc_k: int = 3
     device: str = 'cuda'
 
 
+def _q2r_torch(q):
+    """Quaternion (w,x,y,z) → 3×3 rotation matrix."""
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    return torch.stack([
+        torch.stack([1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)], dim=-1),
+        torch.stack([2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)], dim=-1),
+        torch.stack([2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)], dim=-1),
+    ], dim=-2)
+
+
 def trajectory_7d_to_34(poses_7d):
+    """Convert [N, 7] (quat+trans) → [N, 3, 4] pose matrices."""
     N = poses_7d.shape[0]
-    R = quaternion_to_matrix(poses_7d[:, :4])
+    R = _q2r_torch(poses_7d[:, :4])
     T = poses_7d[:, 4:7].unsqueeze(-1)
     return torch.cat([R, T], dim=-1)
 
@@ -44,18 +62,45 @@ def run_benchmark(opt: BenchmarkOptions):
     device = torch.device(opt.device if torch.cuda.is_available() else 'cpu')
     print(f"[benchmark] device = {device}")
 
-    # ── CineVLA inference engine ──
-    engine = CineVLAInference(opt)
-    engine.device = device
-    engine.perception = engine.perception.to(device)
-    engine.planner = engine.planner.to(device)
-    engine.refiner = engine.refiner.to(device)
+    # ── Load model ──
+    perception = VideoPerceptionEncoder(opt.perception_dim, opt.image_size)
+    planner = Planner(
+        pose_dim=opt.pose_dim, pose_length=opt.pose_length,
+        perception_dim=opt.perception_dim,
+        hidden_dim=opt.planner_hidden_dim,
+        num_layers=opt.planner_num_layers,
+        num_heads=opt.planner_num_heads,
+        music_ca_layers=opt.music_ca_layers,
+        music_dim=opt.music_dim,
+    )
+    refiner = Refiner(
+        pose_dim=opt.pose_dim, perception_dim=opt.perception_dim,
+        hidden_dim=opt.refiner_hidden_dim,
+        num_layers=opt.refiner_num_layers,
+        num_heads=opt.refiner_num_heads,
+    )
+
+    if opt.resume:
+        from safetensors.torch import load_file
+        ckpt = load_file(opt.resume) if opt.resume.endswith('.safetensors') \
+            else torch.load(opt.resume, map_location='cpu')
+        for name, model in [('perception', perception), ('planner', planner),
+                             ('refiner', refiner)]:
+            sub = {k.replace(f'{name}.', ''): v for k, v in ckpt.items()
+                   if k.startswith(f'{name}.')}
+            model.load_state_dict(sub, strict=False)
+        print(f"[benchmark] loaded checkpoint: {opt.resume}")
+
+    perception = perception.eval().to(device)
+    planner = planner.eval().to(device)
+    refiner = refiner.eval().to(device)
 
     # ── Trajectory encoder ──
     traj_encoder = TrajectoryEncoder(
         pose_dim=opt.pose_dim, hidden_dim=256, output_dim=768,
     ).eval().to(device)
 
+    # Optionally load encoder weights if available
     enc_path = opt.resume.replace('.safetensors', '_traj_enc.safetensors') if opt.resume else None
     if enc_path and os.path.exists(enc_path):
         from safetensors.torch import load_file
@@ -64,9 +109,12 @@ def run_benchmark(opt: BenchmarkOptions):
 
     # ── Load test dataset ──
     ds = CineVLADataset(
-        opt.data_path, split_txt='DataDoP/train_valid.txt',
-        pose_length=opt.pose_length, test=True,
-        test_size=max(opt.test_size, 16), num_frames=opt.num_frames,
+        opt.data_path,
+        split_txt='DataDoP/train_valid.txt',
+        pose_length=opt.pose_length,
+        test=True,
+        test_size=max(opt.test_size, 16),
+        num_frames=opt.num_frames,
     )
     print(f"[benchmark] test samples: {len(ds)}")
 
@@ -75,32 +123,43 @@ def run_benchmark(opt: BenchmarkOptions):
 
     for idx in range(len(ds)):
         sample = ds[idx]
-        gt_poses = sample['poses'].to(device)
-        text = sample['text'] or 'camera movement'
+        frames = sample['frames'].unsqueeze(0).to(device)          # [1, T, 3, H, W]
+        gt_poses = sample['poses'].to(device)                       # [N, 7]
+        text = sample['text']
 
-        # Use CineVLAInference.infer() — no file I/O, no visualization
-        # The image_path must point to the _frames/ directory or _video.mp4
-        base = sample['path']
-        frames_dir = base + '_frames'
-        video_path = base + '_video.mp4'
+        if not text:
+            text = 'camera movement'
 
-        if os.path.exists(video_path):
-            image_path = video_path
-        elif os.path.isdir(frames_dir):
-            image_path = frames_dir
-        else:
-            print(f"[benchmark] skipping {base}: no frames/video")
-            continue
+        # ── Generate trajectory ──
+        perc = perception(frames)
+        out = planner.forward(perc, [text, ''])
+        cond_plan = out['poses'][0]
+        uncond_plan = out['poses'][1]
+        cfg_scale = getattr(opt, 'cfg_scale', 2.0)
+        plan = uncond_plan + cfg_scale * (cond_plan - uncond_plan)
 
-        result = engine.infer(image_path, text)
+        # Closed-loop refinement (simplified — single pass for speed)
+        trajectory = plan.clone()
+        z_pred = perc['features_0']
+        text_feats = planner.encode_text([text])
+        for t in range(min(opt.closed_loop_steps - 1, plan.shape[0] - 1)):
+            fi = min(int(t / opt.closed_loop_steps * frames.shape[1]), frames.shape[1] - 1)
+            z_real = perc['features'][:, fi, :].squeeze(0)
+            error = torch.nn.functional.mse_loss(z_real, z_pred).item()
+            if error > 0.01:
+                remaining = trajectory[t + 1:]
+                if remaining.shape[0] > 0:
+                    refined, z_pred_next = refiner.refine(
+                        z_real, z_pred, remaining, text_feats.squeeze(0))
+                    trajectory[t + 1:] = refined
+                    z_pred = z_pred_next.unsqueeze(0)
 
-        trajectory = result['trajectory']
-        text_feats = result['text_feats']
+        # ── Extract features ──
+        gen_feat = traj_encoder(trajectory.unsqueeze(0)).squeeze(0)   # [768]
+        ref_feat = traj_encoder(gt_poses.unsqueeze(0)).squeeze(0)     # [768]
+        txt_feat = text_feats.mean(dim=1).squeeze(0)                  # [768]
 
-        gen_feat = traj_encoder(trajectory.unsqueeze(0)).squeeze(0)
-        ref_feat = traj_encoder(gt_poses.unsqueeze(0)).squeeze(0)
-        txt_feat = text_feats.mean(dim=1).squeeze(0)
-
+        # Convert to [N, 3, 4] for caption metrics
         traj_34 = trajectory_7d_to_34(trajectory)
         gt_34 = trajectory_7d_to_34(gt_poses)
 
@@ -113,6 +172,8 @@ def run_benchmark(opt: BenchmarkOptions):
     # ── Compute & save ──
     results = metrics.compute()
     os.makedirs(os.path.dirname(opt.output_csv) or '.', exist_ok=True)
+
+    import pandas as pd
     df = pd.DataFrame([results])
     df.to_csv(opt.output_csv, index=False)
     print(f"[benchmark] metrics saved to {opt.output_csv}")

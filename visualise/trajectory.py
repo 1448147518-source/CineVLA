@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 # ── Quaternion utilities ──
 
 def _q2r(q):
-    """Quaternion (w,x,y,z) → 3×3 rotation matrix (numpy version for matplotlib)."""
+    """Quaternion (w,x,y,z) → 3×3 rotation matrix."""
     w, x, y, z = q[0], q[1], q[2], q[3]
     return np.array([
         [1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)],

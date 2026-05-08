@@ -6,8 +6,8 @@ At each step t during inference:
   2. Compare z_t vs predicted ẑ_t → perception error
   3. Refiner: error + remaining trajectory → refined poses + ẑ_{t+1}
 
-Training: Refiner receives planner-output (noisy) trajectory as input and
-ground-truth trajectory as target, learning to predict corrections.
+Training: the Refiner learns to predict corrections from noisy-to-GT trajectory,
+with frame features providing environment context. No depth needed.
 """
 
 import torch
@@ -55,10 +55,8 @@ class Refiner(nn.Module):
     def forward(self,
                 z_real: torch.Tensor,          # [B, dim] real frame feature at step t
                 z_predicted: torch.Tensor,      # [B, dim] predicted feature for step t
-                planned_poses: torch.Tensor,    # [B, remaining, 7]  (planner output in training)
+                planned_poses: torch.Tensor,    # [B, remaining, 7]
                 text_features: torch.Tensor,    # [B, L_t, text_dim]
-                gt_poses: torch.Tensor = None,  # [B, remaining, 7]  (ground-truth, training only)
-                z_next_target: torch.Tensor = None,  # [B, dim]  (next-frame feature, training only)
                 ) -> dict:
         B, N = planned_poses.shape[:2]
         device = planned_poses.device
@@ -68,12 +66,12 @@ class Refiner(nn.Module):
         z_token = self.z_proj(z_cat).unsqueeze(1)              # [B, 1, hidden]
         error = self.error_encoder(z_real - z_predicted).unsqueeze(1)  # [B, 1, hidden]
 
-        # Encode remaining trajectory (planner output or GT, depending on caller)
+        # Encode remaining trajectory
         pose_tokens = self.pose_proj(planned_poses)
         pose_tokens = pose_tokens + self.pos_embed[:, :N, :]
 
-        # Sequence: [z_token, error, pose_1, ..., pose_N]
-        seq = torch.cat([z_token, error, pose_tokens], dim=1)  # [B, 2+N, hidden]
+        # Sequence: [z_token, error_token, pose_1, ..., pose_N]
+        seq = torch.cat([z_token, error_token, pose_tokens], dim=1)  # [B, 2+N, hidden]
         seq = self.transformer(seq)
 
         # Text conditioning
@@ -85,27 +83,18 @@ class Refiner(nn.Module):
         seq = self.norm(seq)
         pose_feats = seq[:, 2:, :]  # skip z + error tokens
 
-        pose_delta = self.pose_delta_head(pose_feats)           # [B, N, 7]
+        pose_delta = self.pose_delta_head(pose_feats)
 
         # Predict next frame feature from context
         z_ctx = seq[:, 0, :] + seq[:, 2:, :].mean(dim=1)
-        z_next = self.z_pred_head(z_ctx)                        # [B, dim]
+        z_next = self.z_pred_head(z_ctx)
 
-        refined = planned_poses + pose_delta                    # [B, N, 7]
-
-        # ── Losses (only during training when gt_poses is provided) ──
-        if gt_poses is not None:
-            loss_pose = F.mse_loss(refined, gt_poses)
-            target = z_next_target if z_next_target is not None else z_real
-            loss_z = F.mse_loss(z_next, target)
-            loss = loss_pose + 0.1 * loss_z
-        else:
-            loss_pose = loss_z = loss = torch.tensor(0.0, device=device)
+        refined = planned_poses + pose_delta
 
         return {
-            'pose_delta': pose_delta, 'refined': refined,
+            'pose_delta': pose_delta,
+            'refined': refined,
             'z_next_pred': z_next,
-            'loss': loss, 'loss_pose': loss_pose, 'loss_z': loss_z,
         }
 
     @torch.no_grad()
