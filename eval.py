@@ -20,7 +20,7 @@ from core.options import AllConfigs
 from core.perception import VideoPerceptionEncoder
 from core.planner import Planner
 from core.refiner import Refiner
-from core.utils import slerp_trajectory
+from core.quaternion import slerp_trajectory, quat_to_rotmat
 from visualise.trajectory import plot_trajectory
 from visualise.latent import LatentLogger
 
@@ -192,7 +192,7 @@ class CineVLAInference:
         # ── Output ──
         poses_34 = torch.zeros(trajectory.shape[0], 3, 4)
         for i, p in enumerate(trajectory):
-            R = _q2r(p[:4])
+            R = quat_to_rotmat(p[:4])
             poses_34[i, :, :3] = R
             poses_34[i, :, 3] = p[4:7]
         dense = slerp_trajectory(poses_34, self.opt.dense_frames)
@@ -219,19 +219,15 @@ class CineVLAInference:
         return {'trajectory': trajectory, 'dense': dense}
 
 
-def _q2r(q):
-    w, x, y, z = q
-    return torch.tensor([
-        [1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
-        [2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)],
-        [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)],
-    ])
-
-
 def main():
     opt = tyro.cli(AllConfigs)
     engine = CineVLAInference(opt)
-    engine.run(opt.image_path or 'input.jpg', opt.text or '',
+    if not opt.image_path:
+        raise RuntimeError(
+            "No input specified. Provide --image_path to a _frames/ directory "
+            "or video file (.mp4/.avi/.mov/.mkv)."
+        )
+    engine.run(opt.image_path, opt.text or '',
                music_path=opt.music_path,
                output_dir=os.path.join(opt.workspace, opt.exp_name or 'output'))
 

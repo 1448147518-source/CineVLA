@@ -9,18 +9,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-
-
-# ── Quaternion utilities ──
-
-def _q2r(q):
-    """Quaternion (w,x,y,z) → 3×3 rotation matrix."""
-    w, x, y, z = q[0], q[1], q[2], q[3]
-    return np.array([
-        [1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
-        [2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)],
-        [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)],
-    ])
+from core.quaternion import quat_to_rotmat_np
 
 
 # ── Plotting helpers ──
@@ -104,7 +93,7 @@ def plot_trajectory(
     for i in range(0, N, frame_stride):
         q = trajectory[i, :4]
         pos = trajectory[i, 4:7]
-        R = _q2r(q)
+        R = quat_to_rotmat_np(q)
         alpha = 0.35 + 0.60 * (i / max(1, N - 1))
         _camera_frame(ax, pos, R, frame_scale, alpha, label=str(i))
 

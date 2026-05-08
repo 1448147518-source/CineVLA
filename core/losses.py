@@ -19,6 +19,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from core.quaternion import quat_conjugate, quat_multiply
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Primitive loss functions
@@ -59,28 +61,6 @@ def l1_translation_loss(t_pred: torch.Tensor, t_gt: torch.Tensor) -> torch.Tenso
         scalar tensor
     """
     return t_pred.sub(t_gt).abs().mean()
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Quaternion algebra helpers
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _quat_conjugate(q: torch.Tensor) -> torch.Tensor:
-    """Quaternion conjugate (inverse for unit quaternions).  q: [..., 4] (w,x,y,z)."""
-    w, x, y, z = q.unbind(-1)
-    return torch.stack([w, -x, -y, -z], dim=-1)
-
-
-def _quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
-    """Hamilton product q1 ∘ q2.  Both [..., 4] (w,x,y,z)."""
-    w1, x1, y1, z1 = q1.unbind(-1)
-    w2, x2, y2, z2 = q2.unbind(-1)
-    return torch.stack([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2,
-    ], dim=-1)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -131,8 +111,8 @@ def relative_pose_loss(
     for i in range(1, N):
         for j in range(max(0, i - W), i):
             # Relative quaternion: q_{j→i} = conj(q_j) ∘ q_i
-            q_rel_pred = _quat_multiply(_quat_conjugate(q_pred[:, j]), q_pred[:, i])
-            q_rel_gt   = _quat_multiply(_quat_conjugate(q_gt[:, j]),   q_gt[:, i])
+            q_rel_pred = quat_multiply(quat_conjugate(q_pred[:, j]), q_pred[:, i])
+            q_rel_gt   = quat_multiply(quat_conjugate(q_gt[:, j]),   q_gt[:, i])
 
             dot = torch.abs(torch.sum(q_rel_pred * q_rel_gt, dim=-1))
             dot = dot.clamp(-1.0 + 1e-7, 1.0 - 1e-7)

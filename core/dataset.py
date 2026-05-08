@@ -17,7 +17,7 @@ import os, json, glob, random
 import cv2, numpy as np
 import torch
 from torch.utils.data import Dataset
-from core.utils import matrix_to_quaternion
+from core.quaternion import matrix_to_quaternion
 
 
 class CineVLADataset(Dataset):

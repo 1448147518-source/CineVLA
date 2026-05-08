@@ -17,11 +17,12 @@ import os, sys, json
 import numpy as np
 import torch
 import tyro
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from core.quaternion import quat_to_rotmat_batched
 from core.options import Options
 from core.dataset import CineVLADataset, collate_fn
 from core.perception import VideoPerceptionEncoder
@@ -39,20 +40,9 @@ class BenchmarkOptions(Options):
     device: str = 'cuda'
 
 
-def _q2r_torch(q):
-    """Quaternion (w,x,y,z) → 3×3 rotation matrix."""
-    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
-    return torch.stack([
-        torch.stack([1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)], dim=-1),
-        torch.stack([2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)], dim=-1),
-        torch.stack([2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)], dim=-1),
-    ], dim=-2)
-
-
-def trajectory_7d_to_34(poses_7d):
+def _poses_7d_to_34(poses_7d):
     """Convert [N, 7] (quat+trans) → [N, 3, 4] pose matrices."""
-    N = poses_7d.shape[0]
-    R = _q2r_torch(poses_7d[:, :4])
+    R = quat_to_rotmat_batched(poses_7d[:, :4])
     T = poses_7d[:, 4:7].unsqueeze(-1)
     return torch.cat([R, T], dim=-1)
 
@@ -160,8 +150,8 @@ def run_benchmark(opt: BenchmarkOptions):
         txt_feat = text_feats.mean(dim=1).squeeze(0)                  # [768]
 
         # Convert to [N, 3, 4] for caption metrics
-        traj_34 = trajectory_7d_to_34(trajectory)
-        gt_34 = trajectory_7d_to_34(gt_poses)
+        traj_34 = _poses_7d_to_34(trajectory)
+        gt_34 = _poses_7d_to_34(gt_poses)
 
         metrics.add(gen_feat, ref_feat, txt_feat,
                     traj_34_gen=traj_34, traj_34_ref=gt_34)
