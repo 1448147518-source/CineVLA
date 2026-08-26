@@ -56,14 +56,18 @@ class Refiner(nn.Module):
                 z_predicted: torch.Tensor,      # [B, dim] predicted feature for step t
                 planned_poses: torch.Tensor,    # [B, remaining, 7]
                 text_features: torch.Tensor,    # [B, L_t, text_dim]
+                text_padding_mask: torch.Tensor = None,
                 ) -> dict:
         B, N = planned_poses.shape[:2]
         device = planned_poses.device
+        if N > self.pos_embed.shape[1]:
+            raise ValueError(f"Refiner received {N} poses, but supports at most "
+                             f"{self.pos_embed.shape[1]}. Increase pos_embed.")
 
         # Perception comparison + error
         z_cat = torch.cat([z_real, z_predicted], dim=-1)       # [B, 2*dim]
         z_token = self.z_proj(z_cat).unsqueeze(1)              # [B, 1, hidden]
-        error = self.error_encoder(z_real - z_predicted).unsqueeze(1)  # [B, 1, hidden]
+        error_token = self.error_encoder(z_real - z_predicted).unsqueeze(1)  # [B, 1, hidden]
 
         # Encode remaining trajectory
         pose_tokens = self.pose_proj(planned_poses)
@@ -76,7 +80,8 @@ class Refiner(nn.Module):
         # Text conditioning
         text_cond = self.text_proj(text_features)
         seq_norm = self.text_norm(seq)
-        seq_cross, _ = self.text_cross(seq_norm, text_cond, text_cond)
+        seq_cross, _ = self.text_cross(seq_norm, text_cond, text_cond,
+                                       key_padding_mask=text_padding_mask)
         seq = seq + seq_cross
 
         seq = self.norm(seq)
@@ -88,7 +93,11 @@ class Refiner(nn.Module):
         z_ctx = seq[:, 0, :] + seq[:, 2:, :].mean(dim=1)
         z_next = self.z_pred_head(z_ctx)
 
-        refined = planned_poses + pose_delta
+        refined_raw = planned_poses + pose_delta
+        refined = torch.cat([
+            torch.nn.functional.normalize(refined_raw[..., :4], dim=-1, eps=1e-8),
+            refined_raw[..., 4:],
+        ], dim=-1)
 
         return {
             'pose_delta': pose_delta,
@@ -97,7 +106,9 @@ class Refiner(nn.Module):
         }
 
     @torch.no_grad()
-    def refine(self, z_real, z_predicted, planned_poses, text_features):
+    def refine(self, z_real, z_predicted, planned_poses, text_features,
+               text_padding_mask=None):
         out = self.forward(z_real.unsqueeze(0), z_predicted.unsqueeze(0),
-                           planned_poses.unsqueeze(0), text_features.unsqueeze(0))
+                           planned_poses.unsqueeze(0), text_features.unsqueeze(0),
+                           text_padding_mask.unsqueeze(0) if text_padding_mask is not None else None)
         return out['refined'][0], out['z_next_pred'][0]

@@ -7,8 +7,6 @@ transformers==4.47.1
 tokenizers==0.21.2
 openai-clip==1.0.1
 einops==0.8.1
-librosa==0.10.2
-soundfile==0.12.1
 tyro==0.9.25
 numpy==2.1.2
 opencv-python==4.11.0.86

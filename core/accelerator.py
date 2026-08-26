@@ -20,6 +20,9 @@ class _SimpleAccelerator:
     def prepare(self, *args):
         return args
 
+    def unwrap_model(self, model):
+        return model
+
     def backward(self, loss):
         (loss / self.gradient_accumulation_steps).backward()
 

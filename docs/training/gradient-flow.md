@@ -12,9 +12,8 @@
 │           │ViT  │                  │Enc  │                   │
 │           └─────┘                 └─────┘                    │
 │           frame_proj    ✓         z_proj         ✓           │
-│           temporal      ✓         MusicEncoder   ✓           │
+│           temporal      ✓                                      │
 │           temporal_norm ✓         text_proj      ✓           │
-│                                   music_proj     ✓           │
 │                                   traj_queries   ✓           │
 │                                   pos_embed      ✓           │
 │                                   6 × layers     ✓           │
@@ -42,7 +41,7 @@
 │  texts ──→ Planner.encode_text() ──→ text_feats             │
 │              (冻结 text_encoder, 无梯度)                     │
 │                                                              │
-│  Planner 的 trainable params 不参与此阶段                    │
+│  Planner 输出的候选轨迹 detach，不参与此阶段                  │
 │  梯度: loss → Refiner (全部) → Perception (trainable)        │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -58,7 +57,7 @@
 │            total_loss = p_loss + r_loss                      │
 │                                                              │
 │  Perception 同时接收来自两条路径的梯度（叠加）               │
-│  Planner    仅接收 p_loss 的梯度                             │
+│  Planner    接收 p_loss 与经过候选轨迹的 r_loss 梯度          │
 │  Refiner    仅接收 r_loss 的梯度                             │
 │  CLIP ViT + TextEncoder 始终无梯度                           │
 │                                                              │
@@ -71,5 +70,5 @@
 ## 关键点
 
 - CLIP ViT 和 CLIP TextModel 在所有阶段始终冻结，不参与梯度计算
-- 阶段 2 中 Planner 的 trainable 参数（如 z_proj、pose_head 等）不参与——`encode_text` 仅调用冻结的 text_encoder
+- 阶段 2 中 Planner 的候选轨迹在进入 Refiner 前 detach，因此其 trainable 参数不参与优化
 - 阶段 3 中 Perception 同时接收两个 loss 的梯度，形成端到端的联合优化

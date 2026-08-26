@@ -22,8 +22,6 @@ class CineVLA(nn.Module):
             hidden_dim=opt.planner_hidden_dim,
             num_layers=opt.planner_num_layers,
             num_heads=opt.planner_num_heads,
-            music_ca_layers=opt.music_ca_layers,
-            music_dim=opt.music_dim,
         )
         self.refiner = Refiner(
             pose_dim=opt.pose_dim, perception_dim=opt.perception_dim,
@@ -34,14 +32,13 @@ class CineVLA(nn.Module):
 
     def forward_planner(self, batch):
         frames, texts, gt_poses = batch['frames'], batch['text'], batch['poses']
-        music = batch.get('music_path')
 
         # CFG: 10% text dropout during training
         if self.training and random.random() < 0.1:
             texts = [''] * len(texts)
 
         perc = self.perception(frames)
-        out = self.planner(perc, texts, music_path=music if isinstance(music, str) else None)
+        out = self.planner(perc, texts)
 
         # v4: decoupled geometric loss
         eff_N = getattr(self, 'effective_pose_length', None)
@@ -64,23 +61,42 @@ class CineVLA(nn.Module):
         N = self.opt.pose_length
 
         perc = self.perception(frames)
-        text_feats = self.planner.encode_text(texts)
+        text_feats, text_padding_mask = self.planner.encode_text(texts, return_padding_mask=True)
 
-        # Variable chunk-size: sample K in [1, refiner_lookahead]
-        t = torch.randint(1, N - 1, (1,)).item()
-        max_k = min(self.opt.refiner_lookahead, N - 1 - t)
-        K = torch.randint(1, max_k + 1, (1,)).item()
+        # Train on a planner-produced (rather than GT) trajectory.  A detached
+        # plan during the refiner-only stage prevents its loss from changing the
+        # planner; joint training keeps the path differentiable.
+        plan_out = self.planner(perc, texts)
+        planned_trajectory = plan_out['poses']
+        if not self.training or getattr(self, '_refiner_only', False):
+            planned_trajectory = planned_trajectory.detach()
+
+        # Variable chunks train robustness; validation uses a fixed horizon so
+        # its score is comparable across epochs.
+        if self.training:
+            t = torch.randint(0, N - 1, (1,)).item()
+            max_k = min(self.opt.refiner_lookahead, N - 1 - t)
+            K = torch.randint(1, max_k + 1, (1,)).item()
+        else:
+            t = max(0, N // 2 - 1)
+            K = min(self.opt.refiner_lookahead, N - 1 - t)
         T = frames.shape[1]
         frame_idx = min(int(t / N * T), T - 1)
+        next_frame_idx = min(int((t + 1) / N * T), T - 1)
 
         z_real = perc['features'][:, frame_idx, :]
-        z_pred = perc['global']
-        remaining = gt_poses[:, t:t + K, :]
-        raw = self.refiner(z_real, z_pred, remaining, text_feats)
+        # A strictly historical baseline prediction.  It contains no future
+        # frames and is replaced by the learned z prediction during rollout.
+        prev_idx = max(frame_idx - 1, 0)
+        z_pred = perc['features'][:, prev_idx, :]
+        planned = planned_trajectory[:, t + 1:t + 1 + K, :]
+        target = gt_poses[:, t + 1:t + 1 + K, :]
+        z_next_target = perc['features'][:, next_frame_idx, :].detach()
+        raw = self.refiner(z_real, z_pred, planned, text_feats, text_padding_mask)
 
         # v4: geometric refiner loss
         loss, comps = refiner_loss(
-            raw['refined'], remaining, raw['z_next_pred'], z_real,
+            raw['refined'], target, raw['z_next_pred'], z_next_target,
             lambda_pose=self.opt.lambda_pose_delta,
             lambda_z=self.opt.lambda_z_pred,
             lambda_rel=self.opt.lambda_rel_ref,

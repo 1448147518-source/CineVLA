@@ -15,6 +15,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def causal_attention_mask(length: int, device: torch.device) -> torch.Tensor:
+    """Return an additive mask that prevents a timestep from reading the future."""
+    return torch.triu(
+        torch.full((length, length), float('-inf'), device=device), diagonal=1
+    )
+
+
 class VideoPerceptionEncoder(nn.Module):
     """
     Encode an RGB frame sequence into per-frame environment latents.
@@ -33,6 +40,7 @@ class VideoPerceptionEncoder(nn.Module):
         import clip
         self.clip_model, _ = clip.load("ViT-B/32", device="cpu")
         self.clip_model = self.clip_model.visual
+        self.freeze_backbone = freeze_backbone
         if freeze_backbone:
             self.clip_model.eval()
             for p in self.clip_model.parameters():
@@ -56,13 +64,22 @@ class VideoPerceptionEncoder(nn.Module):
     CLIP_MEAN = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
     CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
 
-    @torch.no_grad()
     def _clip_features(self, frames: torch.Tensor) -> torch.Tensor:
         """frames: [B*T, 3, H, W] → [B*T, 512]"""
         if frames.shape[-1] != 224:
             frames = F.interpolate(frames, (224, 224), mode='bilinear', align_corners=False)
         frames = (frames - self.CLIP_MEAN.to(frames.device)) / self.CLIP_STD.to(frames.device)
+        if self.freeze_backbone:
+            with torch.no_grad():
+                return self.clip_model(frames)
         return self.clip_model(frames)
+
+    def train(self, mode=True):
+        """Do not let a frozen CLIP backbone acquire train-time stochasticity."""
+        super().train(mode)
+        if self.freeze_backbone:
+            self.clip_model.eval()
+        return self
 
     def forward(self, frames: torch.Tensor) -> dict:
         """
@@ -77,6 +94,9 @@ class VideoPerceptionEncoder(nn.Module):
         """
         B, T = frames.shape[:2]
         device = frames.device
+        if T > self.temporal_pos.shape[1]:
+            raise ValueError(f"Received {T} frames, but temporal encoder supports at most "
+                             f"{self.temporal_pos.shape[1]}.")
 
         # Per-frame CLIP
         flat = frames.reshape(B * T, *frames.shape[2:])
@@ -90,12 +110,15 @@ class VideoPerceptionEncoder(nn.Module):
         # Add temporal positional encoding
         feats = feats + self.temporal_pos[:, :T, :]
 
-        # Temporal aggregation
-        feats = self.temporal(feats)
+        # Temporal aggregation.  This mask is essential: the latent at t is
+        # used by the online controller and must not encode frames t+1...T.
+        feats = self.temporal(feats, mask=causal_attention_mask(T, device))
         feats = self.temporal_norm(feats)  # [B, T, dim]
 
-        # Global scene embedding (mean pool over time)
-        global_feat = feats.mean(dim=1)  # [B, dim]
+        # The final causal state summarizes the available observation history.
+        # Mean pooling would be unsuitable as an online state if callers append
+        # future observations later.
+        global_feat = feats[:, -1, :]  # [B, dim]
 
         return {
             'features': feats,

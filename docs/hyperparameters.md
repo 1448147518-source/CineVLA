@@ -28,9 +28,6 @@
 | `refiner_num_layers` | 4 | Refiner 编码器层数 |
 | `refiner_num_heads` | 4 | Refiner 注意力头数 |
 | `refiner_lookahead` | 5 | 每次修正的最大帧数 |
-| `music_dim` | 128 | 音乐特征维度 |
-| `music_seq_len` | 30 | 音乐序列长度 |
-| `music_ca_layers` | 2 | 音乐交叉注意力的 Planner 顶层数 |
 
 ## 训练
 

@@ -28,7 +28,8 @@ from core.dataset import CineVLADataset, collate_fn
 from core.perception import VideoPerceptionEncoder
 from core.planner import Planner
 from core.refiner import Refiner
-from core.metrics import MetricsAccumulator
+from core.utils import repeat_perception
+from core.metrics import MetricsAccumulator, compute_pose_metrics
 from evaluate.trajectory_encoder import TrajectoryEncoder
 
 
@@ -38,6 +39,7 @@ class BenchmarkOptions(Options):
     output_csv: str = 'metrics/benchmark.csv'
     prdc_k: int = 3
     device: str = 'cuda'
+    trajectory_encoder: Optional[str] = None  # pretrained trajectory-text encoder; optional
 
 
 def _poses_7d_to_34(poses_7d):
@@ -60,8 +62,6 @@ def run_benchmark(opt: BenchmarkOptions):
         hidden_dim=opt.planner_hidden_dim,
         num_layers=opt.planner_num_layers,
         num_heads=opt.planner_num_heads,
-        music_ca_layers=opt.music_ca_layers,
-        music_dim=opt.music_dim,
     )
     refiner = Refiner(
         pose_dim=opt.pose_dim, perception_dim=opt.perception_dim,
@@ -85,17 +85,19 @@ def run_benchmark(opt: BenchmarkOptions):
     planner = planner.eval().to(device)
     refiner = refiner.eval().to(device)
 
-    # ── Trajectory encoder ──
-    traj_encoder = TrajectoryEncoder(
-        pose_dim=opt.pose_dim, hidden_dim=256, output_dim=768,
-    ).eval().to(device)
-
-    # Optionally load encoder weights if available
-    enc_path = opt.resume.replace('.safetensors', '_traj_enc.safetensors') if opt.resume else None
-    if enc_path and os.path.exists(enc_path):
+    # Distribution/text metrics are valid only with an explicitly supplied,
+    # pretrained encoder.  A random trajectory encoder would produce numbers
+    # but not an evaluable scientific claim.
+    traj_encoder = None
+    if opt.trajectory_encoder:
+        traj_encoder = TrajectoryEncoder(
+            pose_dim=opt.pose_dim, hidden_dim=256, output_dim=768,
+        ).eval().to(device)
         from safetensors.torch import load_file
-        traj_encoder.load_state_dict(load_file(enc_path), strict=False)
-        print(f"[benchmark] loaded trajectory encoder: {enc_path}")
+        traj_encoder.load_state_dict(load_file(opt.trajectory_encoder), strict=True)
+        print(f"[benchmark] loaded trajectory encoder: {opt.trajectory_encoder}")
+    else:
+        print('[benchmark] CLaTr/FCD/PRDC disabled: no pretrained trajectory encoder supplied')
 
     # ── Load test dataset ──
     ds = CineVLADataset(
@@ -103,13 +105,14 @@ def run_benchmark(opt: BenchmarkOptions):
         split_txt='DataDoP/train_valid.txt',
         pose_length=opt.pose_length,
         test=True,
-        test_size=max(opt.test_size, 16),
+        test_size=opt.test_size,
         num_frames=opt.num_frames,
     )
     print(f"[benchmark] test samples: {len(ds)}")
 
     # ── Metrics accumulator ──
     metrics = MetricsAccumulator(prdc_k=opt.prdc_k)
+    pose_totals = {}
 
     for idx in range(len(ds)):
         sample = ds[idx]
@@ -122,7 +125,7 @@ def run_benchmark(opt: BenchmarkOptions):
 
         # ── Generate trajectory ──
         perc = perception(frames)
-        out = planner.forward(perc, [text, ''])
+        out = planner.forward(repeat_perception(perc, repeats=2), [text, ''])
         cond_plan = out['poses'][0]
         uncond_plan = out['poses'][1]
         cfg_scale = getattr(opt, 'cfg_scale', 2.0)
@@ -145,22 +148,29 @@ def run_benchmark(opt: BenchmarkOptions):
                     z_pred = z_pred_next.unsqueeze(0)
 
         # ── Extract features ──
-        gen_feat = traj_encoder(trajectory.unsqueeze(0)).squeeze(0)   # [768]
-        ref_feat = traj_encoder(gt_poses.unsqueeze(0)).squeeze(0)     # [768]
-        txt_feat = text_feats.mean(dim=1).squeeze(0)                  # [768]
+        direct = compute_pose_metrics(trajectory, gt_poses)
+        for key, value in direct.items():
+            pose_totals[key] = pose_totals.get(key, 0.0) + value
 
         # Convert to [N, 3, 4] for caption metrics
         traj_34 = _poses_7d_to_34(trajectory)
         gt_34 = _poses_7d_to_34(gt_poses)
 
-        metrics.add(gen_feat, ref_feat, txt_feat,
-                    traj_34_gen=traj_34, traj_34_ref=gt_34)
+        if traj_encoder is not None:
+            gen_feat = traj_encoder(trajectory.unsqueeze(0)).squeeze(0)
+            ref_feat = traj_encoder(gt_poses.unsqueeze(0)).squeeze(0)
+            txt_feat = text_feats.mean(dim=1).squeeze(0)
+            metrics.add(gen_feat, ref_feat, txt_feat,
+                        traj_34_gen=traj_34, traj_34_ref=gt_34)
 
         if (idx + 1) % 10 == 0:
             print(f"[benchmark] {idx + 1}/{len(ds)} samples processed")
 
     # ── Compute & save ──
-    results = metrics.compute()
+    results = {key: value / len(ds) for key, value in pose_totals.items()}
+    results['num_samples'] = len(ds)
+    if traj_encoder is not None:
+        results.update(metrics.compute())
     os.makedirs(os.path.dirname(opt.output_csv) or '.', exist_ok=True)
 
     import pandas as pd

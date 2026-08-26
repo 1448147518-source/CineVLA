@@ -9,7 +9,7 @@ CineVLA 是一个闭环视觉-语言-动作系统。模型在每一步运动后�
 
 ```
 Phase 1: 初始规划（因果）
-  frame_0（仅第一帧） + 文本 [+ 音乐] → Video Perception(causal) → Planner → 初始轨迹
+  frame_0（仅第一帧） + 文本 → Video Perception(causal) → Planner → 初始轨迹
 
 Phase 2: 闭环执行（因果）
   camera 走到 p_t → 捕捉当前帧 img_t
@@ -19,17 +19,18 @@ Phase 2: 闭环执行（因果）
   camera 走到修正后的 p_{t+1}
 ```
 
-时序 Transformer 采用**因果掩码**：frame_i 的自注意力仅允许看到 frame_0...frame_i，无法注意到后续帧。这保证了闭环修正中每一步的感知严格依赖于已观测帧。
+时序 Transformer 采用**因果掩码**：frame_i 的自注意力仅允许看到 frame_0...frame_i，无法注意到后续帧。这保证了闭环修正中每一步的感知严格依赖于已观测帧。离线评测将视频帧按时间顺序提供给控制器；部署时应由相机/仿真器在每步执行后追加新观测，而不是预先提供未来帧。
 
-音乐可选，仅在 Planner 顶层交叉注意力中注入节奏特征，使轨迹跟随节拍律动。
+推理遵循统一的 `CameraEnvironment` 接口：`reset() → observe → plan → step(pose) → observe`。当前默认的 `OfflineReplayEnv` 逐帧回放真实视频，适合验证因果 rollout 与日志链路；它不会按提交的相机位姿重新渲染画面，因此不能作为 action-conditioned 闭环性能的实验结论。后续可替换为 Blender、Unity 或真实相机适配器。
+
+渲染器/真实相机适配规范见 [环境接口文档](docs/environment.md)。
 
 ## 组件
 
 | 组件 | 功能 |
 |------|------|
 | Video Perception | CLIP ViT-B/32 + 时序 Transformer，从 RGB 帧序列中提取 3D 感知特征 |
-| Planner | 因果 Transformer，从帧序列特征 + 文本 + 音乐节奏生成初始轨迹 |
-| Music Encoder | librosa 提取 BPM/节拍/onset，编码为 30 帧节奏特征 |
+| Planner | 因果 Transformer，从帧序列特征 + 文本生成初始轨迹 |
 | Refiner | 轻量 Transformer，用真实帧特征 vs 预测特征的误差修正轨迹 |
 
 ## 安装
@@ -46,6 +47,8 @@ pip install -r requirements.txt --break-system-packages
 python train.py default --workspace workspace --exp_name run1
 ```
 
+训练会以固定随机种子切分 train/validation，并在每个 epoch 写入验证损失。每个阶段各自保存 `best_{stage}.safetensors`；联合训练阶段的最佳模型同时保存为 `best.safetensors`。`last.safetensors` 每个 epoch 覆盖保存，旁边的 `last.training.pt` 保存优化器、学习率调度器、阶段/epoch、随机数状态；以 `--resume path/to/last.safetensors` 恢复时会自动续训。`config.json` 记录完整实验配置。
+
 ## 推理
 
 ```bash
@@ -55,16 +58,13 @@ python eval.py default --image_path "shot_0070_frames/" --text "镜头推进..."
 # MP4 视频
 python eval.py default --image_path "shot_0070_video.mp4" --text "镜头推进..." --resume "ckpt.safetensors"
 
-# 带音乐律动（舞蹈拍摄等场景）
-python eval.py default --image_path "frames/" --text "..." \
-    --music_path "bgm.mp3" --resume "ckpt.safetensors"
 ```
 
 注意：推理不再支持单张图片输入。请使用 `_frames/` 目录或 `.mp4` 视频文件。
 
 ## Benchmark 评估
 
-对测试集批量评估，计算 CLaTr 标准指标（FCD、PRDC、CLaTr Score），结果保存为 CSV。
+对测试集批量评估，默认计算可解释的相机位姿误差；若提供经过训练的轨迹-文本编码器，额外计算 CLaTr 标准分布指标，结果保存为 CSV。
 
 ```bash
 python -m evaluate.eval_benchmark --resume ckpt.safetensors --data_path DataDoP/train
@@ -73,11 +73,12 @@ python -m evaluate.eval_benchmark --resume ckpt.safetensors --data_path DataDoP/
 评估流程：
 1. 加载 CineVLA 模型权重
 2. 遍历测试集所有样本，逐个生成轨迹
-3. 用 `TrajectoryEncoder` 分别编码生成轨迹和 GT 轨迹，得到特征向量
-4. 用 CLIP 文本编码器提取文本特征
-5. 聚合全部样本特征，计算：
+3. 计算旋转和位移的直接误差（主指标）
+4. 可选：用已训练的 `TrajectoryEncoder` 聚合分布指标
 
 | 指标 | 含义 |
+| `pose/rotation_deg` | 四元数测地旋转误差（度，越低越好） |
+| `pose/translation_l1` / `pose/translation_l2` | 数据集归一化坐标系中的位移误差（越低越好） |
 |------|------|
 | `clatr/fcd` | Frechet 距离 — 生成轨迹与真实轨迹的分布差异（越低越好） |
 | `clatr/precision` | 生成轨迹落在真实流形内的比例 |
@@ -91,9 +92,9 @@ python -m evaluate.eval_benchmark --resume ckpt.safetensors --data_path DataDoP/
 
 结果输出：`./metrics/benchmark.csv`
 
-### 自行训练 TrajectoryEncoder
+### 可选的 TrajectoryEncoder 指标
 
-首次使用时 `TrajectoryEncoder` 为随机初始化，可添加训练损失使其学到更好的轨迹特征表示。将编码器权重保存为 `*_traj_enc.safetensors` 与 checkpoint 同名，评估脚本会自动加载。
+随机初始化的 `TrajectoryEncoder` 不具有评估含义，因此不会再自动启用。只有在独立训练并固定该编码器后，才通过 `--trajectory_encoder path/to/encoder.safetensors` 启用 FCD、PRDC、CLaTr Score；论文中应说明其训练数据与冻结策略。
 
 ## 可视化
 
@@ -158,7 +159,6 @@ dataset/
 │   ├── shot_0070_rgb.png        # 第一帧 RGB 图像（任意分辨率，训练时 resize 到 224×224）
 │   ├── shot_0070_caption.json   # 文本描述
 │   ├── shot_0070_transforms_cleaning.json  # 相机轨迹
-│   ├── shot_0070_music.mp3       # （可选）音乐文件
 │   ├── shot_0070_video.mp4       # 视频文件（与 _frames/ 二选一，同时存在优先 video）
 │   └── shot_0070_frames/         # 多帧序列目录（与 video 二选一）
 │       ├── 000.png
@@ -200,7 +200,7 @@ dataset/
 }
 ```
 
-`frames` 数组至少 120 帧（等距采样 30 帧做轨迹）。`transform_matrix` 为 4×4 c2w 矩阵。
+`frames` 数组至少 120 帧（等距采样 30 帧做轨迹）。`transform_matrix` 为 4×4 c2w 矩阵；焦距字段使用 `fl_x`、`fl_y`（兼容历史数据中的 `fy`）。
 
 **`_frames/` 目录**
 
@@ -213,4 +213,3 @@ MP4 视频文件，自动等距抽取 8 帧。视频总帧数必须 ≥ 8，否�
 ---
 
 > **README 维护约定**：所有新增功能均需同步更新本文档。命令行参数、模块结构、输出路径等如有变动，须在对应章节反映。
-

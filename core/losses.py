@@ -43,7 +43,7 @@ def geodesic_rotation_loss(q_pred: torch.Tensor, q_gt: torch.Tensor) -> torch.Te
         scalar tensor — mean geodesic distance in radians [0, π]
     """
     dot = torch.abs(torch.sum(q_pred * q_gt, dim=-1))
-    dot = dot.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+    dot = dot.clamp(0.0, 1.0)
     return 2 * torch.acos(dot).mean()
 
 
@@ -115,7 +115,7 @@ def relative_pose_loss(
             q_rel_gt   = quat_multiply(quat_conjugate(q_gt[:, j]),   q_gt[:, i])
 
             dot = torch.abs(torch.sum(q_rel_pred * q_rel_gt, dim=-1))
-            dot = dot.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+            dot = dot.clamp(0.0, 1.0)
             total_rot += 2 * torch.acos(dot).sum()
 
             # Relative translation (global-frame difference)
@@ -173,7 +173,7 @@ def trajectory_smoothness_loss(
     # Rotation angular-acceleration
     quat = F.normalize(poses[..., :4], dim=-1, eps=1e-8)
     dot_omega = torch.abs(torch.sum(quat[:, 1:] * quat[:, :-1], dim=-1))
-    dot_omega = dot_omega.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+    dot_omega = dot_omega.clamp(0.0, 1.0)
     omega = 2 * torch.acos(dot_omega)                          # [B, N-1]
     acc_rot = (omega[:, 1:] - omega[:, :-1]).abs().mean()
 
@@ -242,9 +242,9 @@ def planner_loss(
 
 def refiner_loss(
     refined:       torch.Tensor,      # [B, K, 7]
-    planned:       torch.Tensor,      # [B, K, 7]  (GT remaining trajectory)
+    target_poses:  torch.Tensor,      # [B, K, 7]  (GT future trajectory)
     z_next:        torch.Tensor,      # [B, dim]
-    z_real:        torch.Tensor,      # [B, dim]
+    z_next_target: torch.Tensor,      # [B, dim]
     lambda_pose:   float = 1.0,
     lambda_z:      float = 0.1,
     lambda_rel:    float = 0.02,
@@ -256,18 +256,17 @@ def refiner_loss(
     """
     Refiner composite loss.
 
-        L_refiner = λ_pose·L1(delta) + λ_z·MSE(z_next, z_real)
-                    + λ_rel·L_rel(refined, planned) + λ_smooth·L_smooth(refined)
+        L_refiner = λ_pose·(L_rot + L_trans) + λ_z·MSE(z_next, z_{t+1})
+                    + λ_rel·L_rel(refined, target) + λ_smooth·L_smooth(refined)
 
-    L1 on the delta (|refined − planned|) encourages conservative corrections.
-    L_rel and L_smooth on the refined chunk ensure the refiner does not break
-    local geometric consistency when it does correct.
+    The pose loss is against ground truth, not the input plan.  This lets the
+    refiner learn non-zero corrections when the planner is wrong.
 
     Args:
         refined:  [B, K, 7]  refined trajectory chunk
-        planned:  [B, K, 7]  GT trajectory chunk (input to refiner)
+        target_poses: [B, K, 7]  ground-truth trajectory chunk
         z_next:   [B, dim]   predicted next-frame latent feature
-        z_real:   [B, dim]   actual frame latent feature (from perception)
+        z_next_target: [B, dim] actual latent feature at t+1
         lambda_*: loss component weights
 
     Returns:
@@ -276,17 +275,23 @@ def refiner_loss(
     """
     device = refined.device
 
-    # Pose delta regularisation — L1 (more robust than old MSE)
-    L_pose_delta = (refined - planned).abs().mean()
+    # Match rotations on SO(3), so q and -q remain equivalent.  Direct L1 on
+    # raw quaternion coordinates would make the double-cover ambiguous.
+    L_pose_rot = geodesic_rotation_loss(
+        F.normalize(refined[..., :4], dim=-1, eps=1e-8),
+        F.normalize(target_poses[..., :4], dim=-1, eps=1e-8),
+    )
+    L_pose_trans = l1_translation_loss(refined[..., 4:7], target_poses[..., 4:7])
+    L_pose_delta = L_pose_rot + L_pose_trans
 
-    # Feature prediction (unchanged from original)
-    L_z_pred = F.mse_loss(z_next, z_real)
+    # One-step visual world-model supervision.
+    L_z_pred = F.mse_loss(z_next, z_next_target)
 
     # Geometric constraints on the refined chunk
     K = refined.shape[1]
     if K >= 2:
         L_rel_chunk = relative_pose_loss(
-            refined, planned,
+            refined, target_poses,
             window_size=min(window_size, K - 1),
             lambda_trans=lambda_rel_t,
         )
@@ -301,6 +306,8 @@ def refiner_loss(
     with torch.no_grad():
         components = {
             'loss_pose':   L_pose_delta.detach(),
+            'loss_pose_rot': L_pose_rot.detach(),
+            'loss_pose_trans': L_pose_trans.detach(),
             'loss_z':      L_z_pred.detach(),
             'loss_rel':    L_rel_chunk.detach(),
             'loss_smooth': L_smooth_chunk.detach(),

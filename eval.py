@@ -1,235 +1,162 @@
-"""
-CineVLA v3.1 Inference — RGB frame sequence → camera trajectory.
+"""Closed-loop inference for CineVLA.
 
-Supported inputs:
-  - Frame directory (_frames/): loads multiple PNG/JPG frames
-  - MP4 video: extracts evenly-spaced frames automatically
-  - Single images: NOT supported — use a _frames/ directory or video file
-
-Usage:
-  python eval.py default --image_path "frames/" --text "..." --resume "ckpt.safetensors"
-  python eval.py default --image_path "video.mp4" --text "..." --resume "ckpt.safetensors"
+Input frames are exposed only through a ``CameraEnvironment``. The default
+``OfflineReplayEnv`` is useful for deterministic integration tests; it does
+not render observations from commanded poses and must not be used to claim
+action-conditioned closed-loop performance.
 """
 
-import os, json, glob
-import cv2, numpy as np
-import torch, tyro
-import torch.nn.functional as F
+import json
+import os
+
+import numpy as np
+import torch
+import tyro
 
 from core.options import AllConfigs
 from core.perception import VideoPerceptionEncoder
 from core.planner import Planner
 from core.refiner import Refiner
-from core.quaternion import slerp_trajectory, quat_to_rotmat
-from visualise.trajectory import plot_trajectory
+from core.quaternion import quat_to_rotmat, slerp_trajectory
+from core.utils import repeat_perception
+from envs.base import CameraEnvironment
+from envs.offline_replay import OfflineReplayEnv
 from visualise.latent import LatentLogger
+from visualise.trajectory import plot_trajectory
 
 
 class CineVLAInference:
     def __init__(self, opt):
         self.opt = opt
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.perception = VideoPerceptionEncoder(opt.perception_dim, opt.image_size)
-        self.planner = Planner(pose_dim=opt.pose_dim, pose_length=opt.pose_length,
-                               perception_dim=opt.perception_dim,
-                               hidden_dim=opt.planner_hidden_dim,
-                               num_layers=opt.planner_num_layers,
-                               num_heads=opt.planner_num_heads,
-                               music_ca_layers=opt.music_ca_layers,
-                               music_dim=opt.music_dim)
-        self.refiner = Refiner(pose_dim=opt.pose_dim, perception_dim=opt.perception_dim,
-                               hidden_dim=opt.refiner_hidden_dim,
-                               num_layers=opt.refiner_num_layers,
-                               num_heads=opt.refiner_num_heads)
+        self.planner = Planner(
+            pose_dim=opt.pose_dim, pose_length=opt.pose_length,
+            perception_dim=opt.perception_dim, hidden_dim=opt.planner_hidden_dim,
+            num_layers=opt.planner_num_layers, num_heads=opt.planner_num_heads,
+        )
+        self.refiner = Refiner(
+            pose_dim=opt.pose_dim, perception_dim=opt.perception_dim,
+            hidden_dim=opt.refiner_hidden_dim, num_layers=opt.refiner_num_layers,
+            num_heads=opt.refiner_num_heads,
+        )
 
         if opt.resume:
             from safetensors.torch import load_file
-            ckpt = load_file(opt.resume) if opt.resume.endswith('.safetensors') \
+            checkpoint = load_file(opt.resume) if opt.resume.endswith('.safetensors') \
                 else torch.load(opt.resume, map_location='cpu')
             for name, model in [('perception', self.perception), ('planner', self.planner),
-                                 ('refiner', self.refiner)]:
-                sub = {k.replace(f'{name}.', ''): v for k, v in ckpt.items() if k.startswith(f'{name}.')}
-                model.load_state_dict(sub, strict=False)
-            print(f"[INFO] Loaded checkpoint from {opt.resume}")
+                                ('refiner', self.refiner)]:
+                submodule = {key.replace(f'{name}.', ''): value for key, value in checkpoint.items()
+                             if key.startswith(f'{name}.')}
+                model.load_state_dict(submodule, strict=False)
+            print(f'[INFO] Loaded checkpoint from {opt.resume}')
 
-        self.perception = self.perception.eval().to(device)
-        self.planner = self.planner.eval().to(device)
-        self.refiner = self.refiner.eval().to(device)
-        self.device = device
+        self.perception = self.perception.eval().to(self.device)
+        self.planner = self.planner.eval().to(self.device)
+        self.refiner = self.refiner.eval().to(self.device)
 
-    def _load_frame_sequence(self, path, num_frames=8):
-        """Load T frames: _frames/ directory or video file.  No single-image fallback.
+    def _perceive_history(self, history):
+        """Encode only the most recent causal observation window."""
+        frames = torch.stack(history[-self.opt.num_frames:]).unsqueeze(0).to(self.device)
+        return self.perception(frames)
 
-        Priority:
-          1. Directory of PNG/JPG files — real multi-view frames
-          2. MP4/AVI/MOV/MKV — auto-extract evenly-spaced frames
-          3. Anything else → RuntimeError (single images not supported)
-        """
-        path = str(path)
-        Ht = Wt = self.opt.image_size
-
-        def _load_one(p):
-            img = cv2.imread(p, cv2.IMREAD_UNCHANGED).astype(np.float32) / 255.
-            img = img[..., [2, 1, 0]]
-            t = torch.from_numpy(img).permute(2, 0, 1).float()
-            h, w = t.shape[1], t.shape[2]
-            if h > Ht: t = t[:, (h - Ht) // 2:(h - Ht) // 2 + Ht, :]
-            if w > Wt: t = t[:, :, (w - Wt) // 2:(w - Wt) // 2 + Wt]
-            if t.shape[1] < Ht or t.shape[2] < Wt:
-                p = torch.zeros(3, Ht, Wt)
-                hc, wc = t.shape[1], t.shape[2]
-                p[:, (Ht - hc) // 2:(Ht - hc) // 2 + hc,
-                  (Wt - wc) // 2:(Wt - wc) // 2 + wc] = t
-                t = p
-            return t
-
-        # ── Directory of frames ──
-        if os.path.isdir(path):
-            files = sorted(glob.glob(os.path.join(path, '*.png')) +
-                           glob.glob(os.path.join(path, '*.jpg')))[:num_frames]
-            if not files:
-                raise RuntimeError(f"Frame directory is empty: {path}")
-            if len(files) < num_frames:
-                raise RuntimeError(
-                    f"Frame directory {path}: {len(files)} images found, "
-                    f"need >= {num_frames}"
-                )
-            frames = torch.stack([_load_one(f) for f in files])
-            return frames.unsqueeze(0).to(self.device)
-
-        # ── Video file ──
-        if path.endswith(('.mp4', '.avi', '.mov', '.mkv')):
-            cap = cv2.VideoCapture(path)
-            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            if total < num_frames:
-                cap.release()
-                raise RuntimeError(
-                    f"Video {path}: {total} frames total, need >= {num_frames}"
-                )
-            indices = np.linspace(0, total - 1, num_frames, dtype=int)
-            frames = []
-            for i in indices:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-                ret, frame = cap.read()
-                if not ret: break
-                frame = frame.astype(np.float32) / 255.
-                frame = frame[..., [2, 1, 0]]
-                t = torch.from_numpy(frame).permute(2, 0, 1).float()
-                h, w = t.shape[1], t.shape[2]
-                if h > Ht: t = t[:, (h - Ht) // 2:(h - Ht) // 2 + Ht, :]
-                if w > Wt: t = t[:, :, (w - Wt) // 2:(w - Wt) // 2 + Wt]
-                if t.shape[1] < Ht or t.shape[2] < Wt:
-                    p = torch.zeros(3, Ht, Wt)
-                    hc, wc = t.shape[1], t.shape[2]
-                    p[:, (Ht - hc) // 2:(Ht - hc) // 2 + hc,
-                      (Wt - wc) // 2:(Wt - wc) // 2 + wc] = t
-                    t = p
-                frames.append(t)
-            cap.release()
-            if len(frames) < num_frames:
-                raise RuntimeError(
-                    f"Video {path}: could only read {len(frames)}/{num_frames} frames"
-                )
-            return torch.stack(frames).unsqueeze(0).to(self.device)
-
-        # ── Unsupported ──
-        raise RuntimeError(
-            f"Unsupported input: {path}\n"
-            f"Provide a _frames/ directory or a video file (.mp4/.avi/.mov/.mkv). "
-            f"Single-image input is not supported."
-        )
+    def _plan_with_cfg(self, perception, text):
+        cfg_perception = repeat_perception(perception, repeats=2)
+        outputs = self.planner(cfg_perception, [text, ''])['poses']
+        conditional, unconditional = outputs[0], outputs[1]
+        return unconditional + self.opt.cfg_scale * (conditional - unconditional)
 
     @torch.no_grad()
-    def run(self, image_path, text, music_path=None, output_dir='outputs'):
+    def run_environment(self, environment: CameraEnvironment, text, output_dir='outputs'):
+        """Run an observe → plan → step rollout in any camera environment."""
         os.makedirs(output_dir, exist_ok=True)
+        observation = environment.reset()
+        history = [observation.rgb]
 
-        # ── Phase 1: Plan with CFG ──
-        frames = self._load_frame_sequence(image_path, num_frames=self.opt.num_frames)
-        perc = self.perception(frames)
-        text_feats = self.planner.encode_text([text])
+        perception = self._perceive_history(history)
+        text_features = self.planner.encode_text([text])
+        trajectory = self._plan_with_cfg(perception, text)
+        z_predicted = perception['global'].squeeze(0)
+        episode_length = len(environment) if hasattr(environment, '__len__') else None
+        episode_text = f'; episode has {episode_length} observations' if episode_length else ''
+        print(f'[Planner] {trajectory.shape[0]} poses{episode_text}')
 
-        # CFG: batch conditional + unconditional in one forward pass
-        out = self.planner.forward(perc, [text, ''], music_path=music_path)
-        cond_plan = out['poses'][0]
-        uncond_plan = out['poses'][1]
-        # CFG extrapolation
-        cfg_scale = getattr(self.opt, 'cfg_scale', 2.0)
-        plan = uncond_plan + cfg_scale * (cond_plan - uncond_plan)
-        print(f"[Planner] {plan.shape[0]} frames initial trajectory (CFG={cfg_scale})")
-
-        # ── Phase 2: Closed-loop refinement ──
-        trajectory = plan.clone()
-        z_pred = perc['features_0']  # initial prediction
-        N = min(self.opt.closed_loop_steps, plan.shape[0])
+        logger = LatentLogger(save_dir='pred_latent') if self.opt.vis_latent else None
         steps = []
+        max_actions = min(self.opt.closed_loop_steps - 1, trajectory.shape[0] - 1)
+        if episode_length is not None:
+            max_actions = min(max_actions, episode_length - 1)
 
-        latent_logger = None
-        if getattr(self.opt, 'vis_latent', False):
-            latent_logger = LatentLogger(save_dir='pred_latent')
+        for action_index in range(1, max_actions + 1):
+            action = trajectory[action_index].clone()
+            observation, terminated = environment.step(action.cpu())
+            history.append(observation.rgb)
+            perception = self._perceive_history(history)
+            z_real = perception['global'].squeeze(0)
 
-        for t in range(N - 1):
-            T = frames.shape[1]
-            fi = min(int(t / N * T), T - 1)
-            z_real = perc['features'][:, fi, :].squeeze(0)  # current frame feature
+            if logger is not None:
+                logger.log(z_real, z_predicted, step=observation.step, phase='infer')
 
-            # Log latent state if visualization enabled
-            if latent_logger is not None:
-                latent_logger.log(z_real, z_pred, step=t, phase='infer')
+            error = torch.nn.functional.mse_loss(z_real, z_predicted).item()
+            refined = False
+            remaining = trajectory[action_index + 1:]
+            if error > 0.01 and len(remaining) > 0:
+                corrected, z_next_prediction = self.refiner.refine(
+                    z_real, z_predicted, remaining, text_features.squeeze(0)
+                )
+                trajectory[action_index + 1:] = corrected
+                z_predicted = z_next_prediction
+                refined = True
 
-            error = F.mse_loss(z_real, z_pred).item()
-            if error > 0.01:
-                remaining = trajectory[t + 1:]
-                if remaining.shape[0] > 0:
-                    refined, z_pred_next = self.refiner.refine(
-                        z_real, z_pred, remaining, text_feats.squeeze(0))
-                    trajectory[t + 1:] = refined
-                    z_pred = z_pred_next.unsqueeze(0)
-                    print(f"  Step {t}: refined {remaining.shape[0]} frames, err={error:.4f}")
+            steps.append({
+                'step': observation.step,
+                'pose': action.tolist(),
+                'error': error,
+                'refined': refined,
+                'environment': observation.info.get('environment'),
+            })
+            if refined:
+                print(f'  Step {observation.step}: refined {len(remaining)} future poses, err={error:.4f}')
+            if terminated:
+                break
 
-            steps.append({'step': t, 'pose': trajectory[t].tolist(), 'error': error})
-
-        # ── Output ──
         poses_34 = torch.zeros(trajectory.shape[0], 3, 4)
-        for i, p in enumerate(trajectory):
-            R = quat_to_rotmat(p[:4])
-            poses_34[i, :, :3] = R
-            poses_34[i, :, 3] = p[4:7]
+        for index, pose in enumerate(trajectory):
+            poses_34[index, :, :3] = quat_to_rotmat(pose[:4])
+            poses_34[index, :, 3] = pose[4:7]
         dense = slerp_trajectory(poses_34, self.opt.dense_frames)
 
         np.save(os.path.join(output_dir, 'trajectory.npy'), trajectory.cpu().numpy())
         np.save(os.path.join(output_dir, 'trajectory_dense.npy'), dense.cpu().numpy())
-        json.dump(steps, open(os.path.join(output_dir, 'steps.json'), 'w'), indent=2)
-        print(f"[Done] → {output_dir}/")
+        with open(os.path.join(output_dir, 'steps.json'), 'w') as handle:
+            json.dump(steps, handle, indent=2)
+        print(f'[Done] → {output_dir}/')
 
-        # ── Trajectory visualization (always) ──
-        plot_trajectory(
-            trajectory.cpu().numpy(),
-            dense=dense.cpu().numpy(),
-            steps=steps,
-            save_dir='results',
-            title=f'CineVLA — {text[:60]}'
+        plot_trajectory(trajectory.cpu().numpy(), dense=dense.cpu().numpy(), steps=steps,
+                        save_dir='results', title=f'CineVLA — {text[:60]}')
+        if logger is not None:
+            logger.finalize()
+            print('[visualise] Latent state plots saved to pred_latent/')
+        return {'trajectory': trajectory, 'dense': dense, 'steps': steps}
+
+    def run(self, image_path, text, output_dir='outputs'):
+        """Run the default deterministic replay environment from a local input path."""
+        environment = OfflineReplayEnv.from_path(
+            image_path, image_size=self.opt.image_size,
+            max_frames=self.opt.closed_loop_steps,
         )
-
-        # ── Latent visualization finalize ──
-        if latent_logger is not None:
-            latent_logger.finalize()
-            print(f"[visualise] Latent state plots saved to pred_latent/")
-
-        return {'trajectory': trajectory, 'dense': dense}
+        return self.run_environment(environment, text, output_dir)
 
 
 def main():
     opt = tyro.cli(AllConfigs)
-    engine = CineVLAInference(opt)
     if not opt.image_path:
-        raise RuntimeError(
-            "No input specified. Provide --image_path to a _frames/ directory "
-            "or video file (.mp4/.avi/.mov/.mkv)."
-        )
-    engine.run(opt.image_path, opt.text or '',
-               music_path=opt.music_path,
-               output_dir=os.path.join(opt.workspace, opt.exp_name or 'output'))
+        raise RuntimeError('Provide --image_path to a frame directory or video file.')
+    CineVLAInference(opt).run(
+        opt.image_path, opt.text or '',
+        output_dir=os.path.join(opt.workspace, opt.exp_name or 'output'),
+    )
 
 
 if __name__ == '__main__':

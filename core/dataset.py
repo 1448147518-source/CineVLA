@@ -2,7 +2,7 @@
 Dataset for CineVLA v3.1 — RGB-only, no depth required.
 
 Input paradigm:
-  img_0 (_rgb.png) + text (_caption.json) + music (optional) → initial planning
+  img_0 (_rgb.png) + text (_caption.json) → initial planning
   img_i sequence (_frames/ or _video.mp4) → subsequent closed-loop refinement
 
 Frame source priority (mandatory — one of the two MUST exist):
@@ -20,9 +20,23 @@ from torch.utils.data import Dataset
 from core.quaternion import matrix_to_quaternion
 
 
+def split_items(items, validation_size: int, seed: int = 42):
+    """Return deterministic, disjoint train and validation sample lists."""
+    if validation_size < 1:
+        raise ValueError('validation_size must be at least one')
+    if len(items) <= validation_size:
+        raise ValueError(
+            f'need more than {validation_size} valid samples, found {len(items)}'
+        )
+    shuffled = list(sorted(items))
+    random.Random(seed).shuffle(shuffled)
+    return shuffled[:-validation_size], shuffled[-validation_size:]
+
+
 class CineVLADataset(Dataset):
     def __init__(self, path: str, split_txt: str, pose_length=30,
-                 test=False, test_size=1, num_frames=8, image_size=224):
+                 test=False, test_size=1, num_frames=8, image_size=224,
+                 split_seed=42):
         self.path = path
         self.pose_length = pose_length
         self.test = test
@@ -43,11 +57,8 @@ class CineVLADataset(Dataset):
                 if name in valid and self._check(base):
                     basedirs.append(base)
 
-        basedirs = sorted(basedirs)
-        random.seed(42)
-        random.shuffle(basedirs)
-        n = len(basedirs)
-        self.items = basedirs[:-test_size] if not test else basedirs[-test_size:]
+        train_items, validation_items = split_items(basedirs, test_size, split_seed)
+        self.items = validation_items if test else train_items
 
         self.captions = {}
         for b in self.items:
@@ -129,7 +140,12 @@ class CineVLADataset(Dataset):
             j = json.load(open(base + '_transforms_cleaning.json'))
             frames_json = j['frames']
             H, W = j['h'], j['w']
-            fx, fy = j['fl_x'], j['fy']
+            # Nerfstudio/Colmap exports conventionally use ``fl_y``.  Keep
+            # ``fy`` as a backwards-compatible alias for older local data.
+            fx = j['fl_x']
+            fy = j.get('fl_y', j.get('fy'))
+            if fy is None:
+                raise KeyError("missing focal length: expected 'fl_y' (or legacy 'fy')")
             cx, cy = j['cx'], j['cy']
             N = self.pose_length
             total_frames = len(frames_json)
@@ -187,15 +203,12 @@ class CineVLADataset(Dataset):
                 )
 
             text = self.captions.get(base, '')
-            music = base + '_music.mp3' if os.path.exists(base + '_music.mp3') else None
-
             return {
                 'frames': frames,
                 'poses': poses_7d.float(),
                 'c2ws': torch.from_numpy(c2ws_np).float(),
                 'intrinsics': torch.tensor([fx, fy, cx, cy]).float(),
                 'text': text,
-                'music_path': music,
                 'path': base,
             }
         except RuntimeError:
@@ -211,11 +224,9 @@ def collate_fn(batch):
     poses = torch.stack([b['poses'] for b in batch])
     c2ws = torch.stack([b['c2ws'] for b in batch])
     intr = torch.stack([b['intrinsics'] for b in batch])
-    music = [b['music_path'] for b in batch]
     return {
         'frames': frames, 'poses': poses, 'c2ws': c2ws,
         'intrinsics': intr,
         'text': [b['text'] for b in batch],
-        'music_path': music[0] if all(m == music[0] for m in music) else music,
         'paths': [b['path'] for b in batch],
     }

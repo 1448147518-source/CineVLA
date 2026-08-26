@@ -11,9 +11,9 @@
 
 阶段 2: Refiner 预训练 (20 epochs)
     ├── 训练: Perception + Refiner
-    ├── Planner 仅提供冻结的 text_encoder（无梯度）
+    ├── Planner 产生的候选轨迹 detach（不接收梯度）
     ├── 随机采样 chunk: 起点 t 随机, 长度 K ∈ [1, 5]
-    └── 目标: 恒等映射 + 仅在感知不匹配时修正
+    └── 目标: 用因果观测修正 Planner 的候选轨迹，并预测下一观测特征
 
 阶段 3: 联合训练   (50 epochs)
     ├── 训练: Perception + Planner + Refiner 全部可学习参数

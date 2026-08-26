@@ -1,4 +1,7 @@
-import tyro
+try:
+    import tyro
+except ImportError:  # keep model/loss modules importable in lightweight test environments
+    tyro = None
 from dataclasses import dataclass
 from typing import Optional, Dict
 
@@ -27,11 +30,6 @@ class Options:
     refiner_num_heads: int = 4
     refiner_lookahead: int = 5         # refine next K frames per step
 
-    # ── Music ──
-    music_dim: int = 128
-    music_seq_len: int = 30
-    music_ca_layers: int = 2            # top N planner layers with music cross-attn
-
     # ── Training ──
     batch_size: int = 4
     lr: float = 1e-4
@@ -42,15 +40,17 @@ class Options:
     grad_clip: float = 1.0
     warmup_ratio: float = 0.05
     mixed_precision: str = 'bf16'
+    seed: int = 42                    # train/validation split and RNG seed
+    num_workers: int = 2              # DataLoader workers on CUDA (CPU always uses 0)
 
     # ── Paths ──
     workspace: str = 'workspace'
     exp_name: str = 'default'
     resume: Optional[str] = None
     data_path: str = 'DataDoP/train'
+    test_size: int = 16              # held-out samples used by validation / benchmark
     image_path: Optional[str] = None
     text: Optional[str] = None
-    music_path: Optional[str] = None
 
     # ── Inference (closed-loop + CFG) ──
     closed_loop_steps: int = 30        # max closed-loop steps
@@ -70,7 +70,7 @@ class Options:
     lambda_rot_smooth: float = 0.5     # rotation weight inside smoothness term
     lambda_rel_t: float = 0.1          # translation weight inside relative term
     # Refiner
-    lambda_pose_delta: float = 1.0     # L1 delta regularisation
+    lambda_pose_delta: float = 1.0     # geometric pose supervision for the refiner
     lambda_z_pred: float = 0.1         # feature prediction
     lambda_rel_ref: float = 0.02       # relative consistency (refiner)
     lambda_smooth_ref: float = 0.05    # smoothness (refiner)
@@ -85,4 +85,5 @@ config_doc: Dict[str, str] = {}
 config_doc['default'] = 'default CineVLA v3 settings'
 config_defaults['default'] = Options()
 
-AllConfigs = tyro.extras.subcommand_type_from_defaults(config_defaults, config_doc)
+AllConfigs = (tyro.extras.subcommand_type_from_defaults(config_defaults, config_doc)
+              if tyro is not None else Options)

@@ -12,8 +12,31 @@ Metrics:
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from scipy import linalg
 from scipy.stats import mode
+
+
+@torch.no_grad()
+def compute_pose_metrics(poses_pred: torch.Tensor, poses_gt: torch.Tensor) -> dict:
+    """Direct, interpretable camera-pose errors for the primary benchmark.
+
+    Rotation is reported in degrees and is invariant to q/-q. Translation is
+    evaluated in the dataset's normalised coordinate system; report the
+    normalisation convention together with these values in a paper.
+    """
+    q_pred = F.normalize(poses_pred[..., :4], dim=-1, eps=1e-8)
+    q_gt = F.normalize(poses_gt[..., :4], dim=-1, eps=1e-8)
+    dot = (q_pred * q_gt).sum(dim=-1).abs().clamp(0.0, 1.0)
+    rotation_deg = torch.rad2deg(2 * torch.acos(dot))
+    translation_l1 = (poses_pred[..., 4:7] - poses_gt[..., 4:7]).abs().mean(dim=-1)
+    translation_l2 = torch.linalg.vector_norm(
+        poses_pred[..., 4:7] - poses_gt[..., 4:7], dim=-1)
+    return {
+        'pose/rotation_deg': rotation_deg.mean().item(),
+        'pose/translation_l1': translation_l1.mean().item(),
+        'pose/translation_l2': translation_l2.mean().item(),
+    }
 
 
 # ── Helper: multivariate Gaussian stats ──
@@ -80,7 +103,9 @@ def compute_prdc(
     -------
     dict with keys: precision, recall, density, coverage
     """
-    # Pairwise distances
+    if len(feats_real) < 2 or len(feats_fake) < 2:
+        raise ValueError('PRDC requires at least two reference and generated samples.')
+    nearest_k = min(nearest_k, len(feats_real) - 1, len(feats_fake) - 1)
     dist_rr = _pairwise_euclidean(feats_real, feats_real)   # [N, N]
     dist_ff = _pairwise_euclidean(feats_fake, feats_fake)   # [M, M]
     dist_rf = _pairwise_euclidean(feats_real, feats_fake)   # [N, M]
