@@ -1,6 +1,6 @@
 # CineVLA
 
-<p align="center"><img src="assets/CineVLA-v2.svg" alt="CineVLA architecture" width="100%" /></p>
+<p align="center"><img src="assets/CineVLA-paper.svg" alt="CineVLA publication-style architecture figure" width="100%" /></p>
 
 **CineVLA** is an RGB-only visual-language model for camera trajectory generation. From observed RGB frames and a director-style text instruction, it predicts an initial camera path and refines the remaining path using visual feedback.
 

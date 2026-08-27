@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="960" viewBox="0 0 1600 960" role="img" aria-labelledby="title desc">
+  <title id="title">CineVLA method overview</title>
+  <desc id="desc">A publication-style method figure for RGB-only visual-language camera trajectory generation and feedback refinement.</desc>
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#405166"/></marker>
+    <marker id="arrblue" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#2b6cb0"/></marker>
+    <style>
+      .title{font:700 31px Arial,sans-serif;fill:#152238}.panel{font:700 18px Arial,sans-serif;fill:#152238}.head{font:700 16px Arial,sans-serif;fill:#22334b}.body{font:400 14px Arial,sans-serif;fill:#44546a}.small{font:400 12px Arial,sans-serif;fill:#65758b}.math{font:italic 15px Georgia,serif;fill:#23354d}.box{stroke-width:1.6;rx:13}.flow{fill:none;stroke:#405166;stroke-width:2.2;marker-end:url(#arr)}.feedback{fill:none;stroke:#2b6cb0;stroke-width:2.5;stroke-dasharray:8 5;marker-end:url(#arrblue)}.dash{fill:none;stroke:#9bacbf;stroke-width:1.5;stroke-dasharray:5 4}.tag{font:700 12px Arial,sans-serif;fill:#fff}.num{font:700 14px Arial,sans-serif;fill:#fff}
+    </style>
+  </defs>
+  <rect width="1600" height="960" fill="#ffffff"/>
+  <text x="68" y="57" class="title">CineVLA: Visual-Language Camera Trajectory Generation with Visual Feedback</text>
+  <text x="68" y="84" class="body">RGB-only camera control. Solid arrows: inference dataflow · dashed blue arrows: feedback state · dashed gray arrows: training supervision.</text>
+
+  <rect x="54" y="118" width="1492" height="350" rx="18" fill="#fbfcfe" stroke="#d7e0eb"/>
+  <circle cx="87" cy="154" r="16" fill="#2b6cb0"/><text x="82" y="159" class="num">A</text>
+  <text x="116" y="160" class="panel">Language-conditioned initial planning</text>
+  <text x="116" y="184" class="small">A causal visual state is built from only the available RGB history; the planner produces an initial camera path.</text>
+
+  <rect x="92" y="235" width="178" height="124" class="box" fill="#edf5ff" stroke="#77aee5"/>
+  <text x="122" y="271" class="head">RGB observations</text><text x="122" y="297" class="math">I₀, …, Iₜ</text><text x="122" y="325" class="small">no depth · no audio</text>
+  <rect x="348" y="220" width="274" height="154" class="box" fill="#edf9f1" stroke="#73b88a"/>
+  <rect x="369" y="238" width="74" height="22" rx="11" fill="#3a9a5d"/><text x="383" y="254" class="tag">causal</text>
+  <text x="374" y="291" class="head">Video Perception Encoder</text><text x="374" y="317" class="body">frozen CLIP ViT-B/32</text><text x="374" y="340" class="body">+ temporal Transformer</text><text x="374" y="361" class="math">z₀, zₜ, {zᵢ}ᵢ≤ₜ</text>
+  <rect x="707" y="235" width="178" height="124" class="box" fill="#fff6e8" stroke="#e6ae59"/>
+  <text x="737" y="271" class="head">Text instruction</text><text x="737" y="297" class="body">director intent</text><text x="737" y="325" class="small">frozen CLIP text</text>
+  <rect x="972" y="220" width="287" height="154" class="box" fill="#f4efff" stroke="#a68bdd"/>
+  <rect x="994" y="238" width="125" height="22" rx="11" fill="#7858bd"/><text x="1007" y="254" class="tag">causal decoder</text>
+  <text x="998" y="291" class="head">Trajectory Planner</text><text x="998" y="317" class="body">visual context + text cross-attention</text><text x="998" y="340" class="body">trajectory query tokens</text><text x="998" y="361" class="small">quaternion normalized to S³</text>
+  <rect x="1345" y="235" width="154" height="124" class="box" fill="#ecf9f9" stroke="#62b5b0"/>
+  <text x="1370" y="271" class="head">Initial plan</text><text x="1370" y="298" class="math">P̂₁:N</text><text x="1370" y="325" class="small">N camera poses</text>
+  <path class="flow" d="M270 297H348"/><path class="flow" d="M622 297H972"/><path class="flow" d="M885 297H972"/><path class="flow" d="M1259 297H1345"/>
+
+  <rect x="54" y="505" width="1492" height="365" rx="18" fill="#fbfcfe" stroke="#d7e0eb"/>
+  <circle cx="87" cy="541" r="16" fill="#2b6cb0"/><text x="82" y="546" class="num">B</text>
+  <text x="116" y="547" class="panel">Feedback-guided trajectory refinement</text>
+  <text x="116" y="571" class="small">After executing a pose, the model compares its visual prediction with the newly observed image and corrects the remaining trajectory.</text>
+  <rect x="92" y="645" width="188" height="126" class="box" fill="#edf5ff" stroke="#77aee5"/>
+  <text x="117" y="681" class="head">Current visual state</text><text x="117" y="708" class="math">Iₜ → zₜ</text><text x="117" y="735" class="small">causal observation history</text>
+  <rect x="359" y="645" width="178" height="126" class="box" fill="#fff0f0" stroke="#de8585"/>
+  <text x="385" y="681" class="head">Prediction error</text><text x="385" y="708" class="math">eₜ = zₜ − ẑₜ</text><text x="385" y="735" class="small">observed − predicted</text>
+  <rect x="615" y="626" width="322" height="164" class="box" fill="#f4efff" stroke="#a68bdd"/>
+  <rect x="637" y="644" width="133" height="22" rx="11" fill="#7858bd"/><text x="651" y="660" class="tag">visual feedback</text>
+  <text x="641" y="697" class="head">Trajectory Refiner</text><text x="641" y="723" class="body">error token + remaining poses + text</text><text x="641" y="747" class="body">Transformer + text cross-attention</text><text x="641" y="771" class="math">(P̃ₜ₊₁:N, ẑₜ₊₁)</text>
+  <rect x="1016" y="645" width="190" height="126" class="box" fill="#ecf9f9" stroke="#62b5b0"/>
+  <text x="1044" y="681" class="head">Execute next pose</text><text x="1044" y="708" class="math">P̃ₜ₊₁</text><text x="1044" y="735" class="small">camera / renderer</text>
+  <rect x="1285" y="645" width="214" height="126" class="box" fill="#edf9f1" stroke="#73b88a"/>
+  <text x="1312" y="681" class="head">Next observation</text><text x="1312" y="708" class="math">Iₜ₊₁</text><text x="1312" y="735" class="small">append to RGB history</text>
+  <path class="flow" d="M280 708H359"/><path class="flow" d="M537 708H615"/><path class="flow" d="M937 708H1016"/><path class="flow" d="M1206 708H1285"/>
+  <path class="feedback" d="M1392 645V607H186V645"/><text x="707" y="619" class="small" fill="#2b6cb0">online loop: execute → observe → correct</text>
+  <path class="feedback" d="M1390 771V821H776V790"/><text x="1005" y="815" class="small" fill="#2b6cb0">carry ẑₜ₊₁ to the next step</text>
+
+  <rect x="54" y="896" width="1492" height="40" rx="12" fill="#eef2f7"/>
+  <text x="76" y="921" class="small">Training objectives: planner — SO(3) geodesic rotation + translation L1 + relative-pose + smoothness; refiner — corrected-pose supervision + next-latent MSE + geometric regularizers.</text>
+</svg>
