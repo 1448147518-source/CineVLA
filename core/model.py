@@ -28,6 +28,8 @@ class CineVLA(nn.Module):
             hidden_dim=opt.refiner_hidden_dim,
             num_layers=opt.refiner_num_layers,
             num_heads=opt.refiner_num_heads,
+            flow_steps=opt.refiner_flow_steps,
+            correction_min_scale=opt.refiner_correction_min_scale,
         )
 
     def forward_planner(self, batch):
@@ -40,7 +42,6 @@ class CineVLA(nn.Module):
         perc = self.perception(frames)
         out = self.planner(perc, texts)
 
-        # v4: decoupled geometric loss
         eff_N = getattr(self, 'effective_pose_length', None)
         loss, comps = planner_loss(
             out['poses'], gt_poses, effective_N=eff_N,
@@ -63,16 +64,13 @@ class CineVLA(nn.Module):
         perc = self.perception(frames)
         text_feats, text_padding_mask = self.planner.encode_text(texts, return_padding_mask=True)
 
-        # Train on a planner-produced (rather than GT) trajectory.  A detached
-        # plan during the refiner-only stage prevents its loss from changing the
-        # planner; joint training keeps the path differentiable.
+        # Planner semantic encoding is reused by the Refiner. During refiner-only
+        # pretraining the trajectory is detached to keep Planner gradients frozen.
         plan_out = self.planner(perc, texts)
         planned_trajectory = plan_out['poses']
         if not self.training or getattr(self, '_refiner_only', False):
             planned_trajectory = planned_trajectory.detach()
 
-        # Variable chunks train robustness; validation uses a fixed horizon so
-        # its score is comparable across epochs.
         if self.training:
             t = torch.randint(0, N - 1, (1,)).item()
             max_k = min(self.opt.refiner_lookahead, N - 1 - t)
@@ -80,32 +78,51 @@ class CineVLA(nn.Module):
         else:
             t = max(0, N // 2 - 1)
             K = min(self.opt.refiner_lookahead, N - 1 - t)
+
+        # Pose index -> observed frame index. Clamp is necessary when the video
+        # sequence is much shorter than the supervised trajectory.
         T = frames.shape[1]
-        frame_idx = min(int(t / N * T), T - 1)
-        next_frame_idx = min(int((t + 1) / N * T), T - 1)
+        frame_idx = min(round(t * (T - 1) / max(N - 1, 1)), T - 1)
+        next_frame_idx = min(frame_idx + 1, T - 1)
 
         z_real = perc['features'][:, frame_idx, :]
-        # A strictly historical baseline prediction.  It contains no future
-        # frames and is replaced by the learned z prediction during rollout.
-        prev_idx = max(frame_idx - 1, 0)
-        z_pred = perc['features'][:, prev_idx, :]
         planned = planned_trajectory[:, t + 1:t + 1 + K, :]
         target = gt_poses[:, t + 1:t + 1 + K, :]
-        z_next_target = perc['features'][:, next_frame_idx, :].detach()
-        raw = self.refiner(z_real, z_pred, planned, text_feats, text_padding_mask)
 
-        # v4: geometric refiner loss
+        # Learned world prediction replaces the historical-placeholder baseline.
+        # It predicts what the observation should look like after the next planned
+        # motion, then the comparator measures prediction-vs-observation error.
+        z_pred = self.refiner.predict_next_latent(
+            z_real, planned[:, :1]
+        )
+        z_next_target = perc['features'][:, next_frame_idx, :].detach()
+
+        raw = self.refiner(
+            z_real, z_pred, planned, text_feats, text_padding_mask,
+            target_poses=target,
+        )
+
         loss, comps = refiner_loss(
-            raw['refined'], target, raw['z_next_pred'], z_next_target,
+            raw['refined'], target,
+            raw['z_next_pred'], z_next_target,
+            flow_velocity=raw['flow_velocity'],
+            flow_target=raw['flow_target'],
             lambda_pose=self.opt.lambda_pose_delta,
             lambda_z=self.opt.lambda_z_pred,
+            lambda_flow=self.opt.lambda_flow,
             lambda_rel=self.opt.lambda_rel_ref,
             lambda_smooth=self.opt.lambda_smooth_ref,
             window_size=self.opt.rel_window_size,
             lambda_rot_smooth=self.opt.lambda_rot_smooth,
             lambda_rel_t=self.opt.lambda_rel_t,
         )
-        return {'loss': loss, 'z_real': z_real, 'z_pred': z_pred, **comps}
+        return {
+            'loss': loss,
+            'z_real': z_real,
+            'z_pred': z_pred,
+            'discrepancy': raw['discrepancy'],
+            **comps,
+        }
 
     def forward(self, batch, stage='joint'):
         if stage == 'planner':
@@ -114,9 +131,11 @@ class CineVLA(nn.Module):
             return self.forward_refiner(batch)
         p = self.forward_planner(batch)
         r = self.forward_refiner(batch)
-        result = {'loss': p['loss'] + r['loss'],
-                  'loss_p': p['loss'], 'loss_r': r['loss'],
-                  'z_real': r.get('z_real'), 'z_pred': r.get('z_pred')}
+        result = {
+            'loss': p['loss'] + r['loss'],
+            'loss_p': p['loss'], 'loss_r': r['loss'],
+            'z_real': r.get('z_real'), 'z_pred': r.get('z_pred'),
+        }
         for k, v in p.items():
             if k.startswith('L_'):
                 result[f'p_{k}'] = v
