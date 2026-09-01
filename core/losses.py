@@ -6,12 +6,7 @@ Design principles (informed by π³, LingBot-Map, VGGT, Kendall & Cipolla):
   2. Enforce pairwise relative-pose consistency in a causal sliding window
   3. Regularise second-order trajectory smoothness (acceleration penalty)
   4. Progressive trajectory-length curriculum for planner pretraining
-
-References:
-  π³:    arXiv:2507.13347  — pairwise relative pose + geodesic + Huber
-  GCT:   arXiv:2604.14141  — c2w abs-pose + causal relative + progressive training
-  VGGT:  arXiv:2503.11651  — explicit camera parameter supervision
-  Kendall & Cipolla, CVPR 2017 — learned homoscedastic uncertainty weighting
+  5. Train Refiner residuals with conditional Flow Matching velocity supervision
 """
 
 from typing import Optional
@@ -22,261 +17,134 @@ import torch.nn.functional as F
 from core.quaternion import quat_conjugate, quat_multiply
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Primitive loss functions
-# ═════════════════════════════════════════════════════════════════════════════
-
 def geodesic_rotation_loss(q_pred: torch.Tensor, q_gt: torch.Tensor) -> torch.Tensor:
-    """
-    Geodesic (angular) distance on SO(3) via unit quaternions.
-
-        d_rot(q̂, q*) = 2 * arccos(|⟨q̂, q*⟩|)
-
-    The absolute value handles the quaternion double-cover (q ≡ -q).
-    Clamp protects against numerical drift outside [-1, 1].
-
-    Args:
-        q_pred: [..., 4]  predicted unit quaternion (w,x,y,z)
-        q_gt:   [..., 4]  ground-truth unit quaternion (w,x,y,z)
-
-    Returns:
-        scalar tensor — mean geodesic distance in radians [0, π]
-    """
     dot = torch.abs(torch.sum(q_pred * q_gt, dim=-1))
     dot = dot.clamp(0.0, 1.0)
     return 2 * torch.acos(dot).mean()
 
 
 def l1_translation_loss(t_pred: torch.Tensor, t_gt: torch.Tensor) -> torch.Tensor:
-    """
-    L1 translation error (element-wise mean over all dimensions).
-
-        L_trans = mean(|t̂ - t*|)
-
-    Args:
-        t_pred: [..., 3]  predicted translation (scene-normalised)
-        t_gt:   [..., 3]  ground-truth translation
-
-    Returns:
-        scalar tensor
-    """
     return t_pred.sub(t_gt).abs().mean()
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Relative-pose consistency loss
-# ═════════════════════════════════════════════════════════════════════════════
-
 def relative_pose_loss(
     poses_pred: torch.Tensor,
-    poses_gt:   torch.Tensor,
+    poses_gt: torch.Tensor,
     window_size: int = 5,
     lambda_trans: float = 0.1,
 ) -> torch.Tensor:
-    """
-    Causal sliding-window pairwise relative-pose consistency.
-
-    For every pair (i, j) with  1 ≤ i < N,  max(0, i-W) ≤ j < i :
-
-        q_rel_pred = conj(q̂_j) ∘ q̂_i      q_rel_gt  = conj(q*_j) ∘ q*_i
-        t_rel_pred = t̂_i − t̂_j             t_rel_gt  = t*_i − t*_j
-
-        L_rel = avg over pairs [ d_rot(q_rel_pred, q_rel_gt)
-                                + λ_t · L1(t_rel_pred, t_rel_gt) ]
-
-    Translations are compared in the global (first-frame-normalised) frame.
-    The window is causal (only observed frames), preventing look-ahead.
-
-    Args:
-        poses_pred: [B, N, 7]  predicted poses  (quat wxyz + trans xyz)
-        poses_gt:   [B, N, 7]  ground-truth poses
-        window_size: max frame distance for pair construction
-        lambda_trans: weight of translation term inside the relative loss
-
-    Returns:
-        scalar tensor
-    """
     B, N, _ = poses_pred.shape
     W = min(window_size, N - 1)
     if W < 1:
         return torch.tensor(0.0, device=poses_pred.device)
 
     q_pred = F.normalize(poses_pred[..., :4], dim=-1, eps=1e-8)
-    q_gt   = F.normalize(poses_gt[..., :4],   dim=-1, eps=1e-8)
+    q_gt = F.normalize(poses_gt[..., :4], dim=-1, eps=1e-8)
     t_pred = poses_pred[..., 4:7]
-    t_gt   = poses_gt[..., 4:7]
+    t_gt = poses_gt[..., 4:7]
 
     total_rot, total_trans, count = 0.0, 0.0, 0
-
     for i in range(1, N):
         for j in range(max(0, i - W), i):
-            # Relative quaternion: q_{j→i} = conj(q_j) ∘ q_i
             q_rel_pred = quat_multiply(quat_conjugate(q_pred[:, j]), q_pred[:, i])
-            q_rel_gt   = quat_multiply(quat_conjugate(q_gt[:, j]),   q_gt[:, i])
-
-            dot = torch.abs(torch.sum(q_rel_pred * q_rel_gt, dim=-1))
-            dot = dot.clamp(0.0, 1.0)
+            q_rel_gt = quat_multiply(quat_conjugate(q_gt[:, j]), q_gt[:, i])
+            dot = torch.abs(torch.sum(q_rel_pred * q_rel_gt, dim=-1)).clamp(0.0, 1.0)
             total_rot += 2 * torch.acos(dot).sum()
 
-            # Relative translation (global-frame difference)
             t_rel_pred = t_pred[:, i] - t_pred[:, j]
-            t_rel_gt   = t_gt[:, i]   - t_gt[:, j]
+            t_rel_gt = t_gt[:, i] - t_gt[:, j]
             total_trans += t_rel_pred.sub(t_rel_gt).abs().sum()
-
             count += B
 
     if count == 0:
         return torch.tensor(0.0, device=poses_pred.device)
-
     return (total_rot + lambda_trans * total_trans) / count
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Trajectory smoothness loss (second-order)
-# ═════════════════════════════════════════════════════════════════════════════
 
 def trajectory_smoothness_loss(
     poses: torch.Tensor,
     lambda_rot_smooth: float = 0.5,
 ) -> torch.Tensor:
-    """
-    Second-order smoothness — penalise acceleration (change in velocity).
-
-    Translation:
-        a_i = t_i − 2·t_{i−1} + t_{i−2}      (central 2nd-order finite diff)
-        L_acc_trans = mean(|a_i|)
-
-    Rotation:
-        ω_i = d_rot(q_i, q_{i−1})             (angular speed, scalar rad/frame)
-        L_acc_rot   = mean(|ω_i − ω_{i−1}|)   (angular acceleration)
-
-    L_smooth = L_acc_trans + λ_rot_smooth · L_acc_rot
-
-    L1 (not L2) is used so that occasional legitimate turns are not
-    over-penalised — the penalty grows linearly, not quadratically.
-
-    Args:
-        poses: [B, N, 7]  trajectory (quat wxyz + trans xyz)
-
-    Returns:
-        scalar tensor
-    """
     B, N = poses.shape[:2]
     if N < 3:
         return torch.tensor(0.0, device=poses.device)
 
     trans = poses[..., 4:7]
-
-    # Translation acceleration (scaled to scene-normalised units)
     acc_trans = (trans[:, 2:] - 2 * trans[:, 1:-1] + trans[:, :-2]).abs().mean()
 
-    # Rotation angular-acceleration
     quat = F.normalize(poses[..., :4], dim=-1, eps=1e-8)
-    dot_omega = torch.abs(torch.sum(quat[:, 1:] * quat[:, :-1], dim=-1))
-    dot_omega = dot_omega.clamp(0.0, 1.0)
-    omega = 2 * torch.acos(dot_omega)                          # [B, N-1]
+    dot_omega = torch.abs(torch.sum(quat[:, 1:] * quat[:, :-1], dim=-1)).clamp(0.0, 1.0)
+    omega = 2 * torch.acos(dot_omega)
     acc_rot = (omega[:, 1:] - omega[:, :-1]).abs().mean()
-
     return acc_trans + lambda_rot_smooth * acc_rot
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Composite loss functions (used by training loop)
-# ═════════════════════════════════════════════════════════════════════════════
-
 def planner_loss(
     poses_pred: torch.Tensor,
-    poses_gt:   torch.Tensor,
+    poses_gt: torch.Tensor,
     effective_N: Optional[int] = None,
-    lambda_rot:   float = 1.0,
+    lambda_rot: float = 1.0,
     lambda_trans: float = 0.5,
-    lambda_rel:   float = 0.05,
+    lambda_rel: float = 0.05,
     lambda_smooth: float = 0.1,
-    window_size:  int   = 5,
+    window_size: int = 5,
     lambda_rot_smooth: float = 0.5,
     lambda_rel_t: float = 0.1,
 ):
-    """
-    Planner composite loss.
-
-        L_planner = λ_rot·L_rot + λ_trans·L_trans + λ_rel·L_rel + λ_smooth·L_smooth
-
-    Args:
-        poses_pred:  [B, N, 7]  predicted trajectory
-        poses_gt:    [B, N, 7]  ground-truth trajectory
-        effective_N: if set, only supervise the first effective_N frames
-                     (used for progressive length curriculum)
-        lambda_* :   loss component weights
-
-    Returns:
-        total_loss:  scalar tensor (for backward)
-        components:  dict of detached scalars (for logging)
-    """
     if effective_N is not None and effective_N < poses_pred.shape[1]:
         poses_pred = poses_pred[:, :effective_N, :]
-        poses_gt   = poses_gt[:, :effective_N, :]
+        poses_gt = poses_gt[:, :effective_N, :]
 
     q_pred = F.normalize(poses_pred[..., :4], dim=-1, eps=1e-8)
-    q_gt   = F.normalize(poses_gt[..., :4],   dim=-1, eps=1e-8)
+    q_gt = F.normalize(poses_gt[..., :4], dim=-1, eps=1e-8)
     t_pred = poses_pred[..., 4:7]
-    t_gt   = poses_gt[..., 4:7]
+    t_gt = poses_gt[..., 4:7]
 
-    L_rot    = geodesic_rotation_loss(q_pred, q_gt)
-    L_trans  = l1_translation_loss(t_pred, t_gt)
-    L_rel    = relative_pose_loss(poses_pred, poses_gt, window_size, lambda_rel_t)
+    L_rot = geodesic_rotation_loss(q_pred, q_gt)
+    L_trans = l1_translation_loss(t_pred, t_gt)
+    L_rel = relative_pose_loss(poses_pred, poses_gt, window_size, lambda_rel_t)
     L_smooth = trajectory_smoothness_loss(poses_pred, lambda_rot_smooth)
 
-    total = lambda_rot * L_rot + lambda_trans * L_trans \
-            + lambda_rel * L_rel + lambda_smooth * L_smooth
-
+    total = (lambda_rot * L_rot + lambda_trans * L_trans
+             + lambda_rel * L_rel + lambda_smooth * L_smooth)
     with torch.no_grad():
         components = {
-            'L_rot':    L_rot.detach(),
-            'L_trans':  L_trans.detach(),
-            'L_rel':    L_rel.detach(),
+            'L_rot': L_rot.detach(),
+            'L_trans': L_trans.detach(),
+            'L_rel': L_rel.detach(),
             'L_smooth': L_smooth.detach(),
         }
-
     return total, components
 
 
 def refiner_loss(
-    refined:       torch.Tensor,      # [B, K, 7]
-    target_poses:  torch.Tensor,      # [B, K, 7]  (GT future trajectory)
-    z_next:        torch.Tensor,      # [B, dim]
-    z_next_target: torch.Tensor,      # [B, dim]
-    lambda_pose:   float = 1.0,
-    lambda_z:      float = 0.1,
-    lambda_rel:    float = 0.02,
+    refined: torch.Tensor,
+    target_poses: torch.Tensor,
+    z_next: torch.Tensor,
+    z_next_target: torch.Tensor,
+    flow_velocity: Optional[torch.Tensor] = None,
+    flow_target: Optional[torch.Tensor] = None,
+    lambda_pose: float = 1.0,
+    lambda_z: float = 0.1,
+    lambda_flow: float = 1.0,
+    lambda_rel: float = 0.02,
     lambda_smooth: float = 0.05,
-    window_size:   int   = 5,
+    window_size: int = 5,
     lambda_rot_smooth: float = 0.5,
-    lambda_rel_t:  float = 0.1,
+    lambda_rel_t: float = 0.1,
 ):
-    """
-    Refiner composite loss.
+    """Composite Refiner objective.
 
-        L_refiner = λ_pose·(L_rot + L_trans) + λ_z·MSE(z_next, z_{t+1})
-                    + λ_rel·L_rel(refined, target) + λ_smooth·L_smooth(refined)
+    Flow Matching is the primary residual-generation objective:
+        x_t = (1-t) x_0 + t x_1,
+        v*  = x_1 - x_0,
+        L_flow = ||v_theta(x_t,t,c) - v*||^2.
 
-    The pose loss is against ground truth, not the input plan.  This lets the
-    refiner learn non-zero corrections when the planner is wrong.
-
-    Args:
-        refined:  [B, K, 7]  refined trajectory chunk
-        target_poses: [B, K, 7]  ground-truth trajectory chunk
-        z_next:   [B, dim]   predicted next-frame latent feature
-        z_next_target: [B, dim] actual latent feature at t+1
-        lambda_*: loss component weights
-
-    Returns:
-        total_loss:  scalar tensor
-        components:  dict of detached scalars
+    Geometric losses remain as auxiliary supervision on the one-step estimate
+    so the generated residual respects camera pose geometry and smoothness.
     """
     device = refined.device
 
-    # Match rotations on SO(3), so q and -q remain equivalent.  Direct L1 on
-    # raw quaternion coordinates would make the double-cover ambiguous.
     L_pose_rot = geodesic_rotation_loss(
         F.normalize(refined[..., :4], dim=-1, eps=1e-8),
         F.normalize(target_poses[..., :4], dim=-1, eps=1e-8),
@@ -284,10 +152,13 @@ def refiner_loss(
     L_pose_trans = l1_translation_loss(refined[..., 4:7], target_poses[..., 4:7])
     L_pose_delta = L_pose_rot + L_pose_trans
 
-    # One-step visual world-model supervision.
     L_z_pred = F.mse_loss(z_next, z_next_target)
 
-    # Geometric constraints on the refined chunk
+    if flow_velocity is not None and flow_target is not None:
+        L_flow = F.mse_loss(flow_velocity, flow_target)
+    else:
+        L_flow = torch.tensor(0.0, device=device)
+
     K = refined.shape[1]
     if K >= 2:
         L_rel_chunk = relative_pose_loss(
@@ -300,25 +171,26 @@ def refiner_loss(
         L_rel_chunk = torch.tensor(0.0, device=device)
         L_smooth_chunk = torch.tensor(0.0, device=device)
 
-    total = (lambda_pose * L_pose_delta + lambda_z * L_z_pred
-             + lambda_rel * L_rel_chunk + lambda_smooth * L_smooth_chunk)
+    total = (
+        lambda_pose * L_pose_delta
+        + lambda_z * L_z_pred
+        + lambda_flow * L_flow
+        + lambda_rel * L_rel_chunk
+        + lambda_smooth * L_smooth_chunk
+    )
 
     with torch.no_grad():
         components = {
-            'loss_pose':   L_pose_delta.detach(),
+            'loss_pose': L_pose_delta.detach(),
             'loss_pose_rot': L_pose_rot.detach(),
             'loss_pose_trans': L_pose_trans.detach(),
-            'loss_z':      L_z_pred.detach(),
-            'loss_rel':    L_rel_chunk.detach(),
+            'loss_z': L_z_pred.detach(),
+            'loss_flow': L_flow.detach(),
+            'loss_rel': L_rel_chunk.detach(),
             'loss_smooth': L_smooth_chunk.detach(),
         }
-
     return total, components
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Progressive trajectory-length curriculum
-# ═════════════════════════════════════════════════════════════════════════════
 
 def get_effective_pose_length(
     epoch: int,
@@ -327,26 +199,6 @@ def get_effective_pose_length(
     full_len: int = 30,
     ramp_epochs: Optional[int] = None,
 ) -> int:
-    """
-    Linearly increase effective trajectory length during planner pretraining.
-
-        N_eff(epoch) = start_len + ⌊(full_len - start_len) · min(1, epoch / ramp_epochs)⌋
-
-    This lets the planner first learn short-range motion patterns,
-    then gradually handle longer-range trajectory structure — analogous
-    to LingBot-Map's 24→320 progressive view training.
-
-    Args:
-        epoch:        current epoch (0-indexed)
-        total_epochs: total epochs for this stage
-        start_len:    initial trajectory length (default 10)
-        full_len:     final trajectory length (default 30 = pose_length)
-        ramp_epochs:  number of epochs over which to ramp up
-                      (default: 2/3 of total_epochs)
-
-    Returns:
-        effective_N (int)
-    """
     if ramp_epochs is None:
         ramp_epochs = max(1, int(total_epochs * 0.67))
     r = min(1.0, epoch / max(1, ramp_epochs))
