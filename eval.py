@@ -1,9 +1,7 @@
 """Closed-loop inference for CineVLA.
 
-Input frames are exposed only through a ``CameraEnvironment``. The default
-``OfflineReplayEnv`` is useful for deterministic integration tests; it does
-not render observations from commanded poses and must not be used to claim
-action-conditioned closed-loop performance.
+Planner perception is CLIP-based; Refiner visual state is a frozen spatial VAE
+latent. The controller follows Predict -> Observe -> Compare -> Correct.
 """
 
 import json
@@ -15,6 +13,7 @@ import tyro
 
 from core.options import AllConfigs
 from core.perception import VideoPerceptionEncoder
+from core.vae_perception import RefinerVAEEncoder
 from core.planner import Planner
 from core.refiner import Refiner
 from core.quaternion import quat_to_rotmat, slerp_trajectory
@@ -29,15 +28,23 @@ class CineVLAInference:
     def __init__(self, opt):
         self.opt = opt
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
         self.perception = VideoPerceptionEncoder(opt.perception_dim, opt.image_size)
         self.planner = Planner(
             pose_dim=opt.pose_dim, pose_length=opt.pose_length,
             perception_dim=opt.perception_dim, hidden_dim=opt.planner_hidden_dim,
             num_layers=opt.planner_num_layers, num_heads=opt.planner_num_heads,
         )
+        self.refiner_vae = RefinerVAEEncoder(
+            model_id=opt.refiner_vae_model,
+            image_size=opt.refiner_vae_image_size,
+            freeze=opt.freeze_refiner_vae,
+        )
         self.refiner = Refiner(
-            pose_dim=opt.pose_dim, perception_dim=opt.perception_dim,
-            hidden_dim=opt.refiner_hidden_dim, num_layers=opt.refiner_num_layers,
+            pose_dim=opt.pose_dim,
+            latent_channels=self.refiner_vae.latent_channels,
+            hidden_dim=opt.refiner_hidden_dim,
+            num_layers=opt.refiner_num_layers,
             num_heads=opt.refiner_num_heads,
             flow_steps=opt.refiner_flow_steps,
             correction_min_scale=opt.refiner_correction_min_scale,
@@ -47,20 +54,33 @@ class CineVLAInference:
             from safetensors.torch import load_file
             checkpoint = load_file(opt.resume) if opt.resume.endswith('.safetensors') \
                 else torch.load(opt.resume, map_location='cpu')
-            for name, model in [('perception', self.perception), ('planner', self.planner),
-                                ('refiner', self.refiner)]:
-                submodule = {key.replace(f'{name}.', ''): value for key, value in checkpoint.items()
-                             if key.startswith(f'{name}.')}
+            for name, model in [
+                ('perception', self.perception),
+                ('planner', self.planner),
+                ('refiner_vae', self.refiner_vae),
+                ('refiner', self.refiner),
+            ]:
+                submodule = {
+                    key.replace(f'{name}.', ''): value
+                    for key, value in checkpoint.items()
+                    if key.startswith(f'{name}.')
+                }
                 model.load_state_dict(submodule, strict=False)
             print(f'[INFO] Loaded checkpoint from {opt.resume}')
 
         self.perception = self.perception.eval().to(self.device)
         self.planner = self.planner.eval().to(self.device)
+        self.refiner_vae = self.refiner_vae.eval().to(self.device)
         self.refiner = self.refiner.eval().to(self.device)
 
     def _perceive_history(self, history):
+        """CLIP temporal perception used only by the Planner."""
         frames = torch.stack(history[-self.opt.num_frames:]).unsqueeze(0).to(self.device)
         return self.perception(frames)
+
+    def _encode_refiner_frame(self, image):
+        """Encode a single RGB observation into a spatial VAE latent."""
+        return self.refiner_vae.encode_frame(image.to(self.device))
 
     def _plan_with_cfg(self, perception, text):
         cfg_perception = repeat_perception(perception, repeats=2)
@@ -70,15 +90,16 @@ class CineVLAInference:
 
     @torch.no_grad()
     def run_environment(self, environment: CameraEnvironment, text, output_dir='outputs'):
-        """Run Predict -> Observe -> Compare -> Correct closed-loop inference."""
         os.makedirs(output_dir, exist_ok=True)
         observation = environment.reset()
         history = [observation.rgb]
 
-        perception = self._perceive_history(history)
-        current_z = perception['global'].squeeze(0)
+        planner_perception = self._perceive_history(history)
         text_features = self.planner.encode_text([text])
-        trajectory = self._plan_with_cfg(perception, text)
+        trajectory = self._plan_with_cfg(planner_perception, text)
+
+        # Refiner state is reconstructive VAE latent, not CLIP feature.
+        current_z = self._encode_refiner_frame(observation.rgb)
 
         episode_length = len(environment) if hasattr(environment, '__len__') else None
         episode_text = f'; episode has {episode_length} observations' if episode_length else ''
@@ -93,21 +114,24 @@ class CineVLAInference:
         for action_index in range(1, max_actions + 1):
             action = trajectory[action_index].clone()
 
-            # Predict what the next observation should look like before executing.
-            z_predicted = self.refiner.predict_next_latent(
-                current_z, action.unsqueeze(0)
-            )
+            # Predict the post-action VAE latent before executing the action.
+            z_predicted = self.refiner.predict_next_latent(current_z, action.unsqueeze(0))
 
             observation, terminated = environment.step(action.cpu())
             history.append(observation.rgb)
-            perception = self._perceive_history(history)
-            z_real = perception['global'].squeeze(0)
+            z_real = self._encode_refiner_frame(observation.rgb)
 
             if logger is not None:
-                logger.log(z_real, z_predicted, step=observation.step, phase='infer')
+                # Existing visualizer expects vectors; pool only for logging.
+                logger.log(
+                    z_real.mean(dim=(-1, -2)),
+                    z_predicted.mean(dim=(-1, -2)),
+                    step=observation.step,
+                    phase='infer',
+                )
 
-            # Cheap scalar gate; the actual correction condition is the learned
-            # discrepancy representation inside Refiner.
+            # Scalar MSE is only a cheap trigger. The actual Compare operation is
+            # the learnable spatial discrepancy encoder inside Refiner.
             error = torch.nn.functional.mse_loss(z_real, z_predicted).item()
             refined = False
             remaining = trajectory[action_index + 1:]
@@ -126,7 +150,10 @@ class CineVLAInference:
                 'environment': observation.info.get('environment'),
             })
             if refined:
-                print(f'  Step {observation.step}: refined {len(remaining)} future poses, err={error:.4f}')
+                print(
+                    f'  Step {observation.step}: refined {len(remaining)} '
+                    f'future poses, err={error:.4f}'
+                )
 
             current_z = z_real
             if terminated:
@@ -144,8 +171,10 @@ class CineVLAInference:
             json.dump(steps, handle, indent=2)
         print(f'[Done] → {output_dir}/')
 
-        plot_trajectory(trajectory.cpu().numpy(), dense=dense.cpu().numpy(), steps=steps,
-                        save_dir='results', title=f'CineVLA — {text[:60]}')
+        plot_trajectory(
+            trajectory.cpu().numpy(), dense=dense.cpu().numpy(), steps=steps,
+            save_dir='results', title=f'CineVLA — {text[:60]}'
+        )
         if logger is not None:
             logger.finalize()
             print('[visualise] Latent state plots saved to pred_latent/')
