@@ -10,12 +10,13 @@ def _poses(batch, length):
 
 
 def test_discrepancy_encoder_is_learnable_and_shape_stable():
-    encoder = LearnableDiscrepancyEncoder(perception_dim=8, hidden_dim=16)
-    z_real = torch.randn(3, 8, requires_grad=True)
-    z_pred = torch.randn(3, 8)
-    out = encoder(z_real, z_pred)
-    assert out.shape == (3, 16)
-    out.square().mean().backward()
+    encoder = LearnableDiscrepancyEncoder(latent_channels=4, hidden_dim=16)
+    z_real = torch.randn(3, 4, 8, 8, requires_grad=True)
+    z_pred = torch.randn(3, 4, 8, 8)
+    fmap, token = encoder(z_real, z_pred)
+    assert fmap.shape == (3, 16, 8, 8)
+    assert token.shape == (3, 16)
+    token.square().mean().backward()
     assert z_real.grad is not None
     assert any(parameter.grad is not None for parameter in encoder.parameters())
 
@@ -23,7 +24,7 @@ def test_discrepancy_encoder_is_learnable_and_shape_stable():
 def test_refiner_flow_matching_training_contract():
     model = Refiner(
         pose_dim=7,
-        perception_dim=8,
+        latent_channels=4,
         hidden_dim=16,
         num_layers=1,
         num_heads=4,
@@ -33,8 +34,8 @@ def test_refiner_flow_matching_training_contract():
     planned = _poses(2, 3)
     target = _poses(2, 3)
     out = model(
-        z_real=torch.randn(2, 8),
-        z_predicted=torch.randn(2, 8),
+        z_real=torch.randn(2, 4, 8, 8),
+        z_predicted=torch.randn(2, 4, 8, 8),
         planned_poses=planned,
         text_features=torch.randn(2, 4, 12),
         target_poses=target,
@@ -49,7 +50,7 @@ def test_refiner_flow_matching_training_contract():
 def test_refiner_inference_integrates_flow_and_normalizes_rotation():
     model = Refiner(
         pose_dim=7,
-        perception_dim=8,
+        latent_channels=4,
         hidden_dim=16,
         num_layers=1,
         num_heads=4,
@@ -59,8 +60,8 @@ def test_refiner_inference_integrates_flow_and_normalizes_rotation():
     planned = _poses(1, 4)
     with torch.no_grad():
         out = model(
-            z_real=torch.randn(1, 8),
-            z_predicted=torch.randn(1, 8),
+            z_real=torch.randn(1, 4, 8, 8),
+            z_predicted=torch.randn(1, 4, 8, 8),
             planned_poses=planned,
             text_features=torch.randn(1, 5, 12),
         )
@@ -69,16 +70,16 @@ def test_refiner_inference_integrates_flow_and_normalizes_rotation():
     assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
 
 
-def test_latent_world_model_predicts_expected_shape():
+def test_latent_world_model_predicts_expected_spatial_shape():
     model = Refiner(
         pose_dim=7,
-        perception_dim=8,
+        latent_channels=4,
         hidden_dim=16,
         num_layers=1,
         num_heads=4,
         text_dim=12,
     )
-    z = torch.randn(2, 8)
+    z = torch.randn(2, 4, 8, 8)
     pose = _poses(2, 1)
     pred = model.predict_next_latent(z, pose)
     assert pred.shape == z.shape
