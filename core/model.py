@@ -1,4 +1,4 @@
-"""CineVLA top-level model — composes Perception, Planner, and Refiner."""
+"""CineVLA top-level model — CLIP Planner + VAE-state Flow Refiner."""
 
 import random
 import torch
@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from core.options import Options
 from core.perception import VideoPerceptionEncoder
+from core.vae_perception import RefinerVAEEncoder
 from core.planner import Planner
 from core.refiner import Refiner
 from core.losses import planner_loss, refiner_loss
@@ -15,6 +16,7 @@ class CineVLA(nn.Module):
     def __init__(self, opt: Options):
         super().__init__()
         self.opt = opt
+        # Planner visual pathway: semantic/contextual CLIP features.
         self.perception = VideoPerceptionEncoder(opt.perception_dim, opt.image_size)
         self.planner = Planner(
             pose_dim=opt.pose_dim, pose_length=opt.pose_length,
@@ -23,8 +25,16 @@ class CineVLA(nn.Module):
             num_layers=opt.planner_num_layers,
             num_heads=opt.planner_num_heads,
         )
+
+        # Refiner visual pathway: reconstructive spatial VAE latent.
+        self.refiner_vae = RefinerVAEEncoder(
+            model_id=opt.refiner_vae_model,
+            image_size=opt.refiner_vae_image_size,
+            freeze=opt.freeze_refiner_vae,
+        )
         self.refiner = Refiner(
-            pose_dim=opt.pose_dim, perception_dim=opt.perception_dim,
+            pose_dim=opt.pose_dim,
+            latent_channels=self.refiner_vae.latent_channels,
             hidden_dim=opt.refiner_hidden_dim,
             num_layers=opt.refiner_num_layers,
             num_heads=opt.refiner_num_heads,
@@ -34,14 +44,11 @@ class CineVLA(nn.Module):
 
     def forward_planner(self, batch):
         frames, texts, gt_poses = batch['frames'], batch['text'], batch['poses']
-
-        # CFG: 10% text dropout during training
         if self.training and random.random() < 0.1:
             texts = [''] * len(texts)
 
         perc = self.perception(frames)
         out = self.planner(perc, texts)
-
         eff_N = getattr(self, 'effective_pose_length', None)
         loss, comps = planner_loss(
             out['poses'], gt_poses, effective_N=eff_N,
@@ -61,11 +68,9 @@ class CineVLA(nn.Module):
         texts = batch['text']
         N = self.opt.pose_length
 
+        # Planner still consumes CLIP-based perception and supplies cached text semantics.
         perc = self.perception(frames)
         text_feats, text_padding_mask = self.planner.encode_text(texts, return_padding_mask=True)
-
-        # Planner semantic encoding is reused by the Refiner. During refiner-only
-        # pretraining the trajectory is detached to keep Planner gradients frozen.
         plan_out = self.planner(perc, texts)
         planned_trajectory = plan_out['poses']
         if not self.training or getattr(self, '_refiner_only', False):
@@ -79,32 +84,31 @@ class CineVLA(nn.Module):
             t = max(0, N // 2 - 1)
             K = min(self.opt.refiner_lookahead, N - 1 - t)
 
-        # Pose index -> observed frame index. Clamp is necessary when the video
-        # sequence is much shorter than the supervised trajectory.
         T = frames.shape[1]
         frame_idx = min(round(t * (T - 1) / max(N - 1, 1)), T - 1)
         next_frame_idx = min(frame_idx + 1, T - 1)
 
-        z_real = perc['features'][:, frame_idx, :]
+        # VAE visual states are independent from Planner CLIP features.
+        z_current = self.refiner_vae(frames[:, frame_idx])
+        z_next_target = self.refiner_vae(frames[:, next_frame_idx]).detach()
+
         planned = planned_trajectory[:, t + 1:t + 1 + K, :]
         target = gt_poses[:, t + 1:t + 1 + K, :]
 
-        # Learned world prediction replaces the historical-placeholder baseline.
-        # It predicts what the observation should look like after the next planned
-        # motion, then the comparator measures prediction-vs-observation error.
-        z_pred = self.refiner.predict_next_latent(
-            z_real, planned[:, :1]
-        )
-        z_next_target = perc['features'][:, next_frame_idx, :].detach()
+        # Predict next VAE state from the current state and the next planned motion,
+        # then compare that prediction with the actual next observation state.
+        z_pred = self.refiner.predict_next_latent(z_current, planned[:, :1])
+        z_real = z_next_target
 
         raw = self.refiner(
             z_real, z_pred, planned, text_feats, text_padding_mask,
             target_poses=target,
         )
 
+        # World-model supervision is aligned to the same t -> t+1 transition.
         loss, comps = refiner_loss(
             raw['refined'], target,
-            raw['z_next_pred'], z_next_target,
+            z_pred, z_next_target,
             flow_velocity=raw['flow_velocity'],
             flow_target=raw['flow_target'],
             lambda_pose=self.opt.lambda_pose_delta,
