@@ -46,14 +46,45 @@ class _FakeTokenizer:
         return {'input_ids': ids, 'attention_mask': mask}
 
 
+class _FakeLatentDist:
+    def __init__(self, latent):
+        self.latent = latent
+
+    def mode(self):
+        return self.latent
+
+
+class _FakeVAE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = types.SimpleNamespace(latent_channels=4, scaling_factor=0.18215)
+
+    @classmethod
+    def from_pretrained(cls, _name):
+        return cls()
+
+    def encode(self, images):
+        # Small deterministic spatial latent; channel 4 is RGB mean.
+        pooled = F.adaptive_avg_pool2d(images, (4, 4))
+        mean_channel = pooled.mean(dim=1, keepdim=True)
+        latent = torch.cat([pooled, mean_channel], dim=1)
+        return types.SimpleNamespace(latent_dist=_FakeLatentDist(latent))
+
+
 def _install_encoder_stubs(monkeypatch):
     clip_stub = types.ModuleType('clip')
     clip_stub.load = lambda *_args, **_kwargs: (types.SimpleNamespace(visual=_FakeVisual()), None)
+
     transformers_stub = types.ModuleType('transformers')
     transformers_stub.CLIPTextModel = _FakeTextModel
     transformers_stub.CLIPTokenizer = _FakeTokenizer
+
+    diffusers_stub = types.ModuleType('diffusers')
+    diffusers_stub.AutoencoderKL = _FakeVAE
+
     monkeypatch.setitem(sys.modules, 'clip', clip_stub)
     monkeypatch.setitem(sys.modules, 'transformers', transformers_stub)
+    monkeypatch.setitem(sys.modules, 'diffusers', diffusers_stub)
 
 
 def _unit_quaternions(batch, length):
@@ -68,6 +99,7 @@ def test_all_training_stages_have_finite_loss_and_normalised_rotations(monkeypat
 
     opt = Options(
         pose_length=4, num_frames=3, image_size=32, perception_dim=16,
+        refiner_vae_image_size=32,
         planner_hidden_dim=16, planner_num_layers=1, planner_num_heads=4,
         refiner_hidden_dim=16, refiner_num_layers=1, refiner_num_heads=4,
         refiner_lookahead=2,
@@ -87,4 +119,7 @@ def test_all_training_stages_have_finite_loss_and_normalised_rotations(monkeypat
 
     with torch.no_grad():
         planned = model.planner(model.perception(batch['frames']), batch['text'])['poses']
-        assert torch.allclose(planned[..., :4].norm(dim=-1), torch.ones_like(planned[..., 0]), atol=1e-5)
+        assert torch.allclose(
+            planned[..., :4].norm(dim=-1),
+            torch.ones_like(planned[..., 0]), atol=1e-5,
+        )

@@ -4,6 +4,7 @@ torchvision==0.21.0+cu124
 accelerate==1.8.1
 safetensors==0.5.3
 transformers==4.47.1
+diffusers==0.32.2
 tokenizers==0.21.2
 openai-clip==1.0.1
 einops==0.8.1
