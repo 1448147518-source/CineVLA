@@ -13,7 +13,7 @@ class Options:
     pose_dim: int = 7
     dense_frames: int = 120
 
-    # ── Perception ──
+    # ── Planner perception (CLIP) ──
     perception_dim: int = 512
     image_size: int = 224
     num_frames: int = 8
@@ -23,6 +23,11 @@ class Options:
     planner_num_layers: int = 6
     planner_num_heads: int = 4
     planner_text_ca_layers: int = 3
+
+    # ── Refiner VAE visual state ──
+    refiner_vae_model: str = 'stabilityai/sd-vae-ft-mse'
+    refiner_vae_image_size: int = 224
+    freeze_refiner_vae: bool = True
 
     # ── Refiner ──
     refiner_hidden_dim: int = 256
