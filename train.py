@@ -1,5 +1,5 @@
 """
-CineVLA v4 Training — RGB-only, frame sequences, no depth.
+CineVLA Training — CLIP Planner + VAE-state Flow Refiner.
 
 Usage:
   python train.py default --workspace workspace --exp_name run1
@@ -21,7 +21,6 @@ from visualise.latent import LatentLogger
 
 
 def move_to_device(value, device):
-    """Recursively move a collated batch without modifying its text fields."""
     if torch.is_tensor(value):
         return value.to(device, non_blocking=True)
     if isinstance(value, dict):
@@ -82,7 +81,10 @@ def main():
                                            pin_memory=(device.type == 'cuda'),
                                            collate_fn=collate_fn)
 
-    optm = torch.optim.AdamW(model.parameters(), lr=opt.lr, weight_decay=0.01)
+    optm = torch.optim.AdamW(
+        (p for p in model.parameters() if p.requires_grad),
+        lr=opt.lr, weight_decay=0.01,
+    )
     total = (opt.planner_pretrain_epochs + opt.refiner_pretrain_epochs + opt.joint_epochs) * len(dl)
 
     def lr_lambda(s):
@@ -105,7 +107,6 @@ def main():
 
     gs = int(resume_state.get('global_step', 0))
 
-    # ── Latent state visualization (optional) ──
     latent_logger = None
     if opt.vis_latent:
         latent_logger = LatentLogger(save_dir='pred_latent')
@@ -157,7 +158,6 @@ def main():
         elif resume_state.get('stage') == 'joint' and name == 'refiner':
             return
         for ep in range(start_ep, epochs):
-            # Progressive trajectory-length curriculum (planner stage only)
             if name == 'planner':
                 model.effective_pose_length = get_effective_pose_length(
                     ep, epochs,
@@ -166,8 +166,6 @@ def main():
                     ramp_epochs=opt.curriculum_ramp_epochs,
                 )
             model.train()
-            # See CineVLA.forward_refiner: detach planner outputs while the
-            # refiner is pre-trained, but allow end-to-end gradients in joint.
             model._refiner_only = (name == 'refiner')
             tl, sl, seen = 0.0, {k: 0.0 for k in keys}, 0
             for batch in dl:
@@ -190,11 +188,16 @@ def main():
                         sl[k] += (out[k].detach().item() if has_acc else out[k].item())
                 seen += 1
 
-                # Latent state logging (for refiner / joint stages)
                 if latent_logger is not None and 'z_real' in out:
                     if gs % opt.vis_latent_every == 0:
-                        latent_logger.log(out['z_real'], out['z_pred'],
-                                         step=gs, phase='train')
+                        z_real_log = out['z_real']
+                        z_pred_log = out['z_pred']
+                        # Refiner VAE latents are spatial; the existing PCA logger
+                        # consumes vectors, so pool spatial dimensions only for logging.
+                        if z_real_log.ndim > 2:
+                            z_real_log = z_real_log.mean(dim=tuple(range(2, z_real_log.ndim)))
+                            z_pred_log = z_pred_log.mean(dim=tuple(range(2, z_pred_log.ndim)))
+                        latent_logger.log(z_real_log, z_pred_log, step=gs, phase='train')
 
                 if gs % 20 == 0:
                     lr = sch.get_last_lr()[0]
@@ -208,9 +211,6 @@ def main():
                         wandb.log(log_dict)
                 gs += 1
 
-            # The lightweight fallback has no dataloader-end hook like
-            # Accelerate.  Flush a final partial accumulation window instead
-            # of silently discarding its gradients.
             if not has_acc and acc._step % opt.grad_accum:
                 acc._should_step = True
                 acc.clip_grad_norm_(model.parameters(), opt.grad_clip)
@@ -247,7 +247,7 @@ def main():
     run_stage('planner', opt.planner_pretrain_epochs,
               keys=('loss', 'L_rot', 'L_trans', 'L_rel', 'L_smooth'))
     run_stage('refiner', opt.refiner_pretrain_epochs,
-              keys=('loss', 'loss_pose', 'loss_z', 'loss_rel', 'loss_smooth'))
+              keys=('loss', 'loss_pose', 'loss_z', 'loss_flow', 'loss_rel', 'loss_smooth'))
     run_stage('joint', opt.joint_epochs,
               keys=('loss', 'loss_p', 'loss_r'))
 
@@ -258,10 +258,3 @@ def main():
     if latent_logger is not None:
         latent_logger.finalize()
         logger.info("[visualise] Latent state summaries saved to pred_latent/")
-
-    if wandb:
-        wandb.finish()
-
-
-if __name__ == '__main__':
-    main()
